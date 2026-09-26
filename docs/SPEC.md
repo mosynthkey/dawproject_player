@@ -1,6 +1,6 @@
 # DAWPROJECT player — specification
 
-Status: decisions from review are folded in. Clip launcher playback stays out until requested.
+Status: review decisions are locked. Arrangement only. Sends, VCA, and built-in devices are unsupported.
 
 This is a playback and render tool for `.dawproject` files, not a DAW. It plays arrangement audio and can write the same mix to a file. MIDI, plug-ins, and recording are out of scope.
 
@@ -67,7 +67,7 @@ Tracktion's stored default for a clip fade-in and fade-out is `AudioFadeCurve::l
 
 ## Engine design
 
-Playback and render call the same mix function. They do not share stretcher state. A render builds a second engine instance from the same project and runs it on a render thread. The stretch quality preset is one global setting and applies to both.
+Playback and render call the same mix function. They do not share stretcher state. A render builds a second engine instance from the same project and runs it on a render thread. Both instances read one shared source cache. The stretch quality preset is one global setting and applies to both.
 
 ### Flatten on load
 
@@ -90,12 +90,28 @@ Playback:
 
 ### Memory
 
-- Do not decode a file into a single buffer, and do not pre-render a stretched proxy.
-- A Signalsmith instance exists only for a clip that is audible inside the look-ahead window.
-- Source audio stays compressed in the zip, or on disk when `external="true"`. miniaudio decodes on seek into a small shared block cache (on the order of 1 MB).
-- Each active clip keeps a FIFO of stretched float frames, about 100–250 ms. At 48 kHz stereo that is under 100 KB per sounding clip.
-- On WASM the zip itself dominates memory, because the browser holds the file.
-- Render writes the file as it goes. The output is not accumulated in RAM.
+Resident audio is a window around the playhead, plus a hard cap on how many clips are being stretched. Nothing in the player expands a clip into a second full copy.
+
+Tracktion splits readers the same way. Uncompressed audio is memory-mapped, so the OS pages in only the range that is touched. Compressed audio uses a block cache: fixed blocks, a per-file sample budget, and reuse of the oldest blocks (`AudioFileCache`). Their notes on compressed streaming say not to buffer a whole decoded file, and not to read compressed audio on the audio thread. This player uses that split, with one extra rule for ZIP: a deflated entry is not random-access, so native inflates it once to a temp file and then treats it as mapped PCM. That temp file is disk, not a second RAM copy.
+
+What is allowed to occupy memory:
+
+- Project model. XML is parsed into plain structs and then freed. Tempo, time signature, and automation stay as breakpoints, not per-sample tables. File paths are interned. Plug-in state, video, and unused entries are never inflated.
+- Source bytes, by access pattern.
+  - Native WAV, or a zip entry stored uncompressed: read sample ranges from the file. No private PCM copy.
+  - Native deflated audio: inflate once to a temp file, then use the same range reads.
+  - FLAC and MP3, and any deflated entry on WASM (there is no separate disk): a single process-wide block cache. Blocks are 16384 frames of int16, after downmix to the channels that clip actually plays (a stereo assignment keeps at most two). The default budget is 8 MiB, shared by every file and by playback and render. Blocks the stretch thread will read inside the current look-ahead are pinned. Unpinned blocks farthest from the playhead are reused. Clips that reference the same path share blocks. Each file has one decoder, owned by the thread that fills the cache, so two clips can sit at different positions without two decoded copies.
+- Stretchers. An instance exists only while its clip overlaps the look-ahead. Ratio 1 and transpose 0 do not create one. Mono files are configured with one channel and duplicated at mix time. The instance is configured at the output sample rate, after any source-rate conversion into the cache, so a 96 kHz or 192 kHz file does not enlarge the FFT. `presetCheaper` at 48 kHz uses a 0.10 s block and a 0.04 s interval. That is on the order of a megabyte of internal state per stereo instance, and it scales with channel count and rate. The pool grows on first use up to 16 instances and is not freed until the project closes, so WASM does not churn a heap that cannot shrink. Each active instance has a 150 ms float FIFO. At 48 kHz stereo that is about 60 KB.
+- Mix scratch. One float block per bus that is audible in this callback, reused. Clips do not get their own mix buffers.
+- Render output. Written through as WAV. Not held.
+
+The audio thread allocates nothing. Cache misses are filled on the stretch thread. If the budget is already pinned and a read still misses, that clip fades out for the block instead of growing the cache.
+
+WASM holds the uploaded `.dawproject` for the life of the page. That copy is the floor. The player does not extract a second copy of each audio entry next to it. The UI reports the Emscripten heap, which is a high-water mark.
+
+The screen shows five counters: source cache used and budget, stretcher pool bytes, FIFO bytes, project-model bytes, and process RSS (native) or Wasm heap (web). The cache budget is a setting, in mebibytes. Lowering it reuses blocks down to the new cap. It does not change the stretcher pool already created.
+
+Simultaneous render uses the same source cache and its own stretcher pool, so the pool cost can double while a render is running. Sequential render touches a narrow forward window, which keeps the shared cache small if playback is stopped.
 
 Signalsmith is stateful. A seek, a loop wrap, or the first block of a clip calls `seek` / `outputSeek` with a pre-roll (`seekLength()`, and `inputLatency()` so output lines up).
 
@@ -107,7 +123,7 @@ Native and WASM both use threads. The audio callback never stretches.
 
 - Audio thread: mix FIFOs, fades, automation gains, pan, and hardware output routing. Lock-free reads only.
 - Stretch thread: fill FIFOs ahead of the playhead. Seek and loop wraps happen here.
-- Render thread: a second engine instance, synchronous stretch inside that instance, same preset as playback. The UI keeps running. Playback and render do not share stretchers.
+- Render thread: a second engine instance, synchronous stretch inside that instance, same preset as playback. The UI keeps running. Playback and render do not share stretchers. They do share the source block cache.
 
 WASM uses Emscripten pthreads (`-pthread`, a pthread pool so `pthread_create` does not have to wait on the browser event loop). The audio callback is an AudioWorklet, which Emscripten runs as a Wasm Worker rather than a pthread, via miniaudio `MA_ENABLE_AUDIO_WORKLETS` (`-sAUDIO_WORKLET -sWASM_WORKERS`). The worklet only reads the FIFO. Stretch and render are pthreads. Shared memory needs `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` on the page. That header pair is the deployment cost. The mix code stays the same as native.
 
@@ -156,7 +172,7 @@ Native writes a path. WASM offers the bytes as a download. Render does not follo
 Native: a dependency-free ANSI screen, not ncurses.
 
 - Transport state, position in seconds, bars, and beats, and the current tempo.
-- Process CPU percent, resident memory, and audio callback load (callback time divided by the buffer duration).
+- Process CPU percent, the memory counters from the memory section, and audio callback load (callback time divided by the buffer duration).
 - Track and bus names with mute, solo, and hardware output assignment.
 - The stretch preset.
 
@@ -193,6 +209,7 @@ Build: CMake. Native executable plus an Emscripten target with pthreads and Audi
 - One stretch preset for playback and render, switchable by the user.
 - WAV render with selectable PCM format, sample rate, and stereo or multi-channel layout.
 - Threads on native and on WASM.
+- A capped source cache, a capped stretcher pool, and no full-file or full-clip audio copies.
 
 ## Out of scope
 
