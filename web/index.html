@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>DAWPROJECT player</title>
+  <style>
+    body { font: 14px/1.4 ui-monospace, monospace; margin: 24px; background: #141414; color: #eee; }
+    button, input, select { font: inherit; margin: 0 6px 6px 0; }
+    #status { white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>DAWPROJECT player</h1>
+  <p>Serve this directory with COOP same-origin and COEP require-corp. <code>python3 serve.py</code> does that.</p>
+  <input id="file" type="file" accept=".dawproject" />
+  <div>
+    <button id="play">Play</button>
+    <button id="pause">Pause</button>
+    <button id="stop">Stop</button>
+    <button id="device">Open device</button>
+    <label>Bar <input id="bar" type="number" value="1" step="1" /></label>
+    <button id="goBar">Go</button>
+    <label>Seconds <input id="seconds" type="number" value="0" step="0.1" /></label>
+    <button id="goTime">Go</button>
+  </div>
+  <div>
+    <label>Preset
+      <select id="preset">
+        <option value="0">cheaper</option>
+        <option value="1">default</option>
+      </select>
+    </label>
+    <label>Cache MiB <input id="cache" type="number" value="8" min="1" /></label>
+    <button id="applyCache">Apply</button>
+    <label>Render
+      <select id="format">
+        <option>f32</option><option>s32</option><option>s24</option><option>s16</option><option>u8</option>
+      </select>
+    </label>
+    <label><input id="multi" type="checkbox" /> multi</label>
+    <button id="render">Render WAV</button>
+  </div>
+  <pre id="status">Load a .dawproject file.</pre>
+  <script>
+    var Module = {
+      onRuntimeInitialized: function () { window.playerReady = true; document.getElementById("status").textContent = "Ready."; }
+    };
+  </script>
+  <script src="dawplay.js"></script>
+  <script>
+    let session = 0;
+    function api(name, result, args) {
+      return Module.ccall(name, result, args.map(function (item) { return item.type; }), args.map(function (item) { return item.value; }));
+    }
+    function ensure() {
+      if (!session) session = api("daw_create", "number", []);
+      return session;
+    }
+    document.getElementById("file").addEventListener("change", async function (event) {
+      const file = event.target.files[0];
+      if (!file || !window.playerReady) return;
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const handle = ensure();
+      const pointer = api("daw_resize_input", "number", [{type: "number", value: handle}, {type: "number", value: bytes.length}]);
+      Module.HEAPU8.set(bytes, pointer);
+      const failed = api("daw_load", "number", [{type: "number", value: handle}]);
+      document.getElementById("status").textContent = failed ? "Load failed" : "Loaded " + file.name;
+    });
+    document.getElementById("play").onclick = function () { api("daw_play", null, [{type: "number", value: ensure()}]); api("daw_start_device", "number", [{type: "number", value: ensure()}]); };
+    document.getElementById("pause").onclick = function () { api("daw_pause", null, [{type: "number", value: ensure()}]); };
+    document.getElementById("stop").onclick = function () { api("daw_stop", null, [{type: "number", value: ensure()}]); };
+    document.getElementById("device").onclick = function () { api("daw_start_device", "number", [{type: "number", value: ensure()}]); };
+    document.getElementById("goBar").onclick = function () {
+      api("daw_seek_bar", null, [{type: "number", value: ensure()}, {type: "number", value: Number(document.getElementById("bar").value)}]);
+    };
+    document.getElementById("goTime").onclick = function () {
+      api("daw_seek_seconds", null, [{type: "number", value: ensure()}, {type: "number", value: Number(document.getElementById("seconds").value)}]);
+    };
+    document.getElementById("preset").onchange = function (event) {
+      api("daw_set_preset", null, [{type: "number", value: ensure()}, {type: "number", value: Number(event.target.value)}]);
+    };
+    document.getElementById("applyCache").onclick = function () {
+      api("daw_set_cache_mib", null, [{type: "number", value: ensure()}, {type: "number", value: Number(document.getElementById("cache").value)}]);
+    };
+    document.getElementById("render").onclick = function () {
+      const format = document.getElementById("format").value;
+      const multi = document.getElementById("multi").checked ? 1 : 0;
+      api("daw_render_start", "number", [
+        {type: "number", value: ensure()},
+        {type: "number", value: 48000},
+        {type: "string", value: format},
+        {type: "number", value: multi}
+      ]);
+    };
+    setInterval(function () {
+      if (!session || !window.playerReady) return;
+      const pointer = api("daw_status_json", "number", [{type: "number", value: session}]);
+      const text = Module.UTF8ToString(pointer);
+      const state = api("daw_render_state", "number", [{type: "number", value: session}]);
+      document.getElementById("status").textContent = text;
+      if (state === 2) {
+        const data = api("daw_render_data", "number", [{type: "number", value: session}]);
+        const size = api("daw_render_size", "number", [{type: "number", value: session}]);
+        if (size > 0 && !window.renderSaved) {
+          window.renderSaved = true;
+          const copy = Module.HEAPU8.slice(data, data + size);
+          const link = document.createElement("a");
+          link.href = URL.createObjectURL(new Blob([copy], {type: "audio/wav"}));
+          link.download = "render.wav";
+          link.click();
+        }
+      } else {
+        window.renderSaved = false;
+      }
+    }, 400);
+  </script>
+</body>
+</html>

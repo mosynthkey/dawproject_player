@@ -1,0 +1,4 @@
+build/
+*.wav
+*.dawproject
+/tmp/

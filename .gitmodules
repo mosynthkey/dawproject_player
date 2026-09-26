@@ -1,0 +1,12 @@
+[submodule "third_party/miniaudio"]
+	path = third_party/miniaudio
+	url = https://github.com/mackron/miniaudio
+[submodule "third_party/signalsmith-stretch"]
+	path = third_party/signalsmith-stretch
+	url = https://github.com/Signalsmith-Audio/signalsmith-stretch
+[submodule "third_party/miniz"]
+	path = third_party/miniz
+	url = https://github.com/richgel999/miniz
+[submodule "third_party/signalsmith-linear"]
+	path = third_party/signalsmith-linear
+	url = https://github.com/Signalsmith-Audio/linear
