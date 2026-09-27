@@ -9,6 +9,8 @@ git submodule update --init --recursive
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ./build/dawplay info song.dawproject
+./build/dawplay devices
+./build/dawplay play song.dawproject --device 0
 ./build/dawplay song.dawproject
 ./build/dawplay song.dawproject next.dawproject
 ./build/dawplay render song.dawproject out.wav --rate 48000 --format f32 --layout stereo

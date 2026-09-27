@@ -10,6 +10,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <poll.h>
 #include <unistd.h>
 #include <termios.h>
 
@@ -20,6 +21,8 @@ void printUsage() {
         "Usage:\n"
         "  dawplay <file.dawproject> [more.dawproject ...]\n"
         "  dawplay info <file.dawproject>\n"
+        "  dawplay devices\n"
+        "  dawplay play <file.dawproject> [--device N]\n"
         "  dawplay render <file.dawproject> <out.wav> [--rate 48000] [--format f32] [--layout stereo]\n"
         "\n"
         "Formats: f32 s32 s24 s16 u8. Layout: stereo or multi.\n"
@@ -569,12 +572,87 @@ int runTui(const std::vector<std::string>& paths, dawplay::LoadResult loaded) {
 
 }  // namespace
 
+int printDevices() {
+    const std::vector<std::string> names = dawplay::listPlaybackDevices();
+    if (names.empty()) {
+        std::fputs("No playback devices\n", stderr);
+        return 1;
+    }
+    for (size_t deviceIndex = 0; deviceIndex < names.size(); ++deviceIndex) {
+        std::printf("%zu\t%s\n", deviceIndex, names[deviceIndex].c_str());
+    }
+    return 0;
+}
+
+// Plays until the arrangement ends or stdin closes. The GUI stops playback by closing the pipe.
+int runHeadless(const std::string& path, int deviceIndex) {
+    dawplay::LoadResult loaded = dawplay::loadProjectFile(path);
+    if (!loaded.error.empty()) {
+        std::fprintf(stderr, "%s\n", loaded.error.c_str());
+        return 1;
+    }
+    dawplay::EngineSettings settings;
+    dawplay::Engine engine(std::move(loaded.store), std::move(loaded.project), settings);
+    if (deviceIndex >= 0) {
+        engine.selectDevice(deviceIndex);
+    }
+    std::string error;
+    if (!engine.startDevice(error)) {
+        std::fprintf(stderr, "%s\n", error.c_str());
+        return 1;
+    }
+    engine.play();
+    std::fputs("playing\n", stdout);
+    std::fflush(stdout);
+    while (engine.playing() || !engine.atArrangementEnd()) {
+        pollfd input{};
+        input.fd = STDIN_FILENO;
+        input.events = POLLIN;
+        const int ready = poll(&input, 1, 200);
+        if (ready > 0) {
+            char byte = 0;
+            if (read(STDIN_FILENO, &byte, 1) <= 0) {
+                break;
+            }
+        } else if (ready < 0) {
+            break;
+        }
+        if (!engine.playing() && engine.atArrangementEnd()) {
+            break;
+        }
+    }
+    engine.pause();
+    engine.stopDevice();
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         printUsage();
         return 1;
     }
     std::string command = argv[1];
+    if (command == "devices") {
+        return printDevices();
+    }
+    if (command == "play") {
+        if (argc < 3) {
+            printUsage();
+            return 1;
+        }
+        const std::string path = argv[2];
+        int deviceIndex = -1;
+        for (int index = 3; index < argc; ++index) {
+            const std::string flag = argv[index];
+            if (flag == "--device" && index + 1 < argc) {
+                deviceIndex = std::stoi(argv[++index]);
+            } else {
+                printUsage();
+                return 1;
+            }
+        }
+        return runHeadless(path, deviceIndex);
+    }
     std::string path;
     std::string output;
     int rate = 48000;

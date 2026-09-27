@@ -1298,6 +1298,23 @@ double Engine::callbackLoad() const {
     return 100.0 * seconds / buffer;
 }
 
+std::vector<std::string> listPlaybackDevices() {
+    std::vector<std::string> names;
+    ma_context context;
+    if (ma_context_init(nullptr, 0, nullptr, &context) != MA_SUCCESS) {
+        return names;
+    }
+    ma_device_info* infos = nullptr;
+    ma_uint32 count = 0;
+    if (ma_context_get_devices(&context, &infos, &count, nullptr, nullptr) == MA_SUCCESS) {
+        for (ma_uint32 device = 0; device < count; ++device) {
+            names.emplace_back(infos[device].name);
+        }
+    }
+    ma_context_uninit(&context);
+    return names;
+}
+
 const char* pcmFormatName(PcmFormat format) {
     switch (format) {
     case PcmFormat::S32:

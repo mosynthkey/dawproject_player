@@ -148,5 +148,6 @@ private:
 
 const char* pcmFormatName(PcmFormat format);
 bool pcmFormatFromName(const std::string& name, PcmFormat& format);
+std::vector<std::string> listPlaybackDevices();
 
 }  // namespace dawplay
