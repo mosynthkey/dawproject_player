@@ -16,25 +16,21 @@ double clampBpm(double bpm) {
 }  // namespace
 
 double AutomationCurve::valueAt(double time) const {
-    if (points.empty()) {
+    if (points.empty() || time < points.front().time) {
         return fallback;
     }
-    if (time < points.front().time) {
-        return fallback;
+    const auto upper = std::upper_bound(points.begin(), points.end(), time,
+                                         [](double query, const AutomationPoint& point) { return query < point.time; });
+    if (upper == points.end()) {
+        return points.back().value;
     }
-    const AutomationPoint* previous = &points.front();
-    for (size_t pointIndex = 1; pointIndex < points.size(); ++pointIndex) {
-        const AutomationPoint& next = points[pointIndex];
-        if (time < next.time) {
-            if (!previous->linear || next.time <= previous->time) {
-                return previous->value;
-            }
-            const double blend = (time - previous->time) / (next.time - previous->time);
-            return previous->value + (next.value - previous->value) * blend;
-        }
-        previous = &next;
+    const AutomationPoint& previous = *(upper - 1);
+    const AutomationPoint& next = *upper;
+    if (!previous.linear || next.time <= previous.time) {
+        return previous.value;
     }
-    return points.back().value;
+    const double blend = (time - previous.time) / (next.time - previous.time);
+    return previous.value + (next.value - previous.value) * blend;
 }
 
 double TempoMap::bpmAt(double beats) const {
@@ -59,147 +55,176 @@ double TempoMap::bpmAt(double beats) const {
     return clampBpm(points.back().bpm);
 }
 
-double TempoMap::secondsBetweenBeats(double beatStart, double beatEnd) const {
-    if (beatEnd < beatStart) {
-        return -secondsBetweenBeats(beatEnd, beatStart);
-    }
-    if (!(beatEnd > beatStart)) {
+double TempoMap::partialSeconds(const Span& span, double beatEnd) {
+    const double end = std::min(beatEnd, span.beat1);
+    const double spanBeats = end - span.beat0;
+    if (!(spanBeats > 0)) {
         return 0;
     }
-    if (points.empty()) {
-        return (beatEnd - beatStart) * 60.0 / 120.0;
+    const double y0 = span.bpm0;
+    const double beatSpan = span.beat1 - span.beat0;
+    if (!span.ramp || !(beatSpan > 0) || std::abs(span.bpm1 - span.bpm0) < 1.0e-9) {
+        return spanBeats * 60.0 / y0;
     }
-
-    std::vector<double> marks;
-    marks.push_back(beatStart);
-    for (const TempoPoint& point : points) {
-        if (point.beats > beatStart && point.beats < beatEnd) {
-            marks.push_back(point.beats);
-        }
+    const double y1 = span.bpm0 + (span.bpm1 - span.bpm0) * (spanBeats / beatSpan);
+    if (std::abs(y1 - y0) < 1.0e-9) {
+        return spanBeats * 60.0 / y0;
     }
-    marks.push_back(beatEnd);
-
-    double seconds = 0;
-    for (size_t markIndex = 0; markIndex + 1 < marks.size(); ++markIndex) {
-        const double left = marks[markIndex];
-        const double right = marks[markIndex + 1];
-        const double span = right - left;
-        if (span <= 0) {
-            continue;
-        }
-        if (left < points.front().beats) {
-            seconds += span * 60.0 / clampBpm(points.front().bpm);
-            continue;
-        }
-        size_t owner = 0;
-        for (size_t pointIndex = 0; pointIndex < points.size(); ++pointIndex) {
-            if (points[pointIndex].beats <= left + 1.0e-9) {
-                owner = pointIndex;
-            }
-        }
-        const bool ramps = points[owner].linear && owner + 1 < points.size();
-        if (!ramps) {
-            seconds += span * 60.0 / clampBpm(points[owner].bpm);
-            continue;
-        }
-        const double beat0 = points[owner].beats;
-        const double beat1 = points[owner + 1].beats;
-        const double bpmStart = clampBpm(points[owner].bpm);
-        const double bpmEnd = clampBpm(points[owner + 1].bpm);
-        const auto bpmAtBeat = [&](double beat) {
-            if (beat1 <= beat0) {
-                return bpmStart;
-            }
-            const double blend = (beat - beat0) / (beat1 - beat0);
-            return clampBpm(bpmStart + (bpmEnd - bpmStart) * blend);
-        };
-        const double y0 = bpmAtBeat(left);
-        const double y1 = bpmAtBeat(right);
-        if (std::abs(y1 - y0) < 1.0e-9) {
-            seconds += span * 60.0 / y0;
-        } else {
-            // 60/bpm integrated across a linear tempo ramp.
-            seconds += 60.0 * span / (y1 - y0) * std::log(y1 / y0);
-        }
-    }
-    return seconds;
+    // 60/bpm integrated across a linear tempo ramp.
+    return 60.0 * spanBeats / (y1 - y0) * std::log(y1 / y0);
 }
 
-double TempoMap::secondsAtBeat(double beats) const {
-    return secondsBetweenBeats(0, beats);
+void TempoMap::ensureSpans() const {
+    const double tailBeat = points.empty() ? 0 : points.back().beats;
+    const double tailBpm = points.empty() ? 120 : points.back().bpm;
+    if (cachedPoints_ == points.size() && cachedTailBeat_ == tailBeat && cachedTailBpm_ == tailBpm && !spans_.empty()) {
+        return;
+    }
+    cachedPoints_ = points.size();
+    cachedTailBeat_ = tailBeat;
+    cachedTailBpm_ = tailBpm;
+    spans_.clear();
+
+    const double headBpm = clampBpm(points.empty() ? 120 : points.front().bpm);
+    const double firstBeat = points.empty() ? 0 : points.front().beats;
+    const double headBeat = std::min(0.0, firstBeat) - 1.0e6;
+    Span head;
+    head.beat0 = headBeat;
+    head.beat1 = firstBeat;
+    head.bpm0 = headBpm;
+    head.bpm1 = headBpm;
+    head.ramp = false;
+    if (head.beat1 > head.beat0) {
+        spans_.push_back(head);
+    }
+    for (size_t pointIndex = 0; pointIndex + 1 < points.size(); ++pointIndex) {
+        Span span;
+        span.beat0 = points[pointIndex].beats;
+        span.beat1 = points[pointIndex + 1].beats;
+        if (!(span.beat1 > span.beat0)) {
+            continue;
+        }
+        span.bpm0 = clampBpm(points[pointIndex].bpm);
+        span.bpm1 = clampBpm(points[pointIndex + 1].bpm);
+        span.ramp = points[pointIndex].linear;
+        spans_.push_back(span);
+    }
+    Span tail;
+    tail.beat0 = firstBeat;
+    if (!points.empty()) {
+        tail.beat0 = points.back().beats;
+    }
+    tail.beat1 = 1.0e300;
+    tail.bpm0 = clampBpm(points.empty() ? 120 : points.back().bpm);
+    tail.bpm1 = tail.bpm0;
+    tail.ramp = false;
+    spans_.push_back(tail);
+
+    double fromLeft = 0;
+    for (Span& span : spans_) {
+        span.second0 = fromLeft;
+        fromLeft += partialSeconds(span, span.beat1);
+    }
+    const double atZero = secondsFromZero(0);
+    for (Span& span : spans_) {
+        span.second0 -= atZero;
+    }
 }
 
-double TempoMap::beatsAtSeconds(double seconds) const {
-    if (seconds <= 0) {
-        return 0;
+double TempoMap::secondsFromZero(double beats) const {
+    if (spans_.empty()) {
+        return beats * 60.0 / 120.0;
     }
-    if (points.empty()) {
-        return seconds * 120.0 / 60.0;
-    }
-    // secondsAtBeat is monotonic for positive tempos, so a binary search is enough.
-    double low = points.front().beats - 64.0;
-    double high = points.back().beats + 64.0;
-    const double tailBpm = clampBpm(points.back().bpm);
-    if (seconds > secondsAtBeat(high)) {
-        high += (seconds - secondsAtBeat(high)) * tailBpm / 60.0 + 8.0;
-    }
-    if (seconds < secondsAtBeat(low)) {
-        const double headBpm = clampBpm(points.front().bpm);
-        low -= (secondsAtBeat(low) - seconds) * headBpm / 60.0 + 8.0;
-    }
-    for (int step = 0; step < 48; ++step) {
-        const double mid = 0.5 * (low + high);
-        if (secondsAtBeat(mid) < seconds) {
+    const Span* chosen = &spans_.front();
+    size_t low = 0;
+    size_t high = spans_.size();
+    while (low + 1 < high) {
+        const size_t mid = low + (high - low) / 2;
+        if (spans_[mid].beat0 <= beats) {
             low = mid;
         } else {
             high = mid;
         }
     }
-    return 0.5 * (low + high);
+    chosen = &spans_[low];
+    return chosen->second0 + partialSeconds(*chosen, beats);
 }
 
-namespace {
+double TempoMap::secondsBetweenBeats(double beatStart, double beatEnd) const {
+    ensureSpans();
+    return secondsFromZero(beatEnd) - secondsFromZero(beatStart);
+}
 
-struct SigRegion {
-    double startBeat = 0;
-    double startBar = 1;
-    double barBeats = 4;
-    double endBeat = 1.0e300;
-};
+double TempoMap::secondsAtBeat(double beats) const {
+    ensureSpans();
+    return secondsFromZero(beats);
+}
 
-std::vector<SigRegion> regionsOf(const TimeSigMap& map) {
-    std::vector<TimeSigPoint> points = map.points;
-    if (points.empty()) {
-        points.push_back(TimeSigPoint{});
+double TempoMap::beatsAtSeconds(double seconds) const {
+    ensureSpans();
+    if (seconds <= 0) {
+        return 0;
     }
-    std::sort(points.begin(), points.end(), [](const TimeSigPoint& left, const TimeSigPoint& right) {
+    const Span* chosen = &spans_.front();
+    size_t low = 0;
+    size_t high = spans_.size();
+    while (low + 1 < high) {
+        const size_t mid = low + (high - low) / 2;
+        if (spans_[mid].second0 <= seconds) {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    chosen = &spans_[low];
+    const double into = seconds - chosen->second0;
+    const double beatSpan = chosen->beat1 - chosen->beat0;
+    const double bpmSpan = chosen->bpm1 - chosen->bpm0;
+    if (!chosen->ramp || !(beatSpan > 0) || std::abs(bpmSpan) < 1.0e-9) {
+        return chosen->beat0 + into * chosen->bpm0 / 60.0;
+    }
+    const double logRatio = into * bpmSpan / (60.0 * beatSpan);
+    const double bpm = chosen->bpm0 * std::exp(logRatio);
+    const double portion = std::clamp((bpm - chosen->bpm0) / bpmSpan, 0.0, 1.0);
+    return chosen->beat0 + portion * beatSpan;
+}
+
+void TimeSigMap::ensureRegions() const {
+    const double tailBeat = points.empty() ? 0 : points.back().beats;
+    if (cachedPoints_ == points.size() && cachedTailBeat_ == tailBeat && !regions_.empty()) {
+        return;
+    }
+    cachedPoints_ = points.size();
+    cachedTailBeat_ = tailBeat;
+    std::vector<TimeSigPoint> sorted = points;
+    if (sorted.empty()) {
+        sorted.push_back(TimeSigPoint{});
+    }
+    std::sort(sorted.begin(), sorted.end(), [](const TimeSigPoint& left, const TimeSigPoint& right) {
         return left.beats < right.beats;
     });
-    std::vector<SigRegion> regions;
+    regions_.clear();
     double bar = 1.0;
-    for (size_t pointIndex = 0; pointIndex < points.size(); ++pointIndex) {
-        SigRegion region;
-        region.startBeat = points[pointIndex].beats;
+    for (size_t pointIndex = 0; pointIndex < sorted.size(); ++pointIndex) {
+        Region region;
+        region.startBeat = sorted[pointIndex].beats;
         region.startBar = bar;
-        const int numerator = std::max(points[pointIndex].numerator, 1);
-        const int denominator = std::max(points[pointIndex].denominator, 1);
+        const int numerator = std::max(sorted[pointIndex].numerator, 1);
+        const int denominator = std::max(sorted[pointIndex].denominator, 1);
         // A "beat" in the file is a quarter note. A 6/8 bar is 3 quarters long.
         region.barBeats = static_cast<double>(numerator) * 4.0 / static_cast<double>(denominator);
-        if (pointIndex + 1 < points.size()) {
-            region.endBeat = points[pointIndex + 1].beats;
+        if (pointIndex + 1 < sorted.size()) {
+            region.endBeat = sorted[pointIndex + 1].beats;
             bar += (region.endBeat - region.startBeat) / region.barBeats;
         }
-        regions.push_back(region);
+        regions_.push_back(region);
     }
-    return regions;
 }
 
-}  // namespace
-
 double TimeSigMap::beatsAtBar(double bar) const {
-    const std::vector<SigRegion> regions = regionsOf(*this);
-    const SigRegion* chosen = &regions.front();
-    for (const SigRegion& region : regions) {
+    ensureRegions();
+    const Region* chosen = &regions_.front();
+    for (const Region& region : regions_) {
         const double regionEndBar = region.startBar + (region.endBeat - region.startBeat) / region.barBeats;
         if (bar >= region.startBar && (bar < regionEndBar || region.endBeat > 1.0e299)) {
             chosen = &region;
@@ -212,9 +237,9 @@ double TimeSigMap::beatsAtBar(double bar) const {
 }
 
 double TimeSigMap::barAtBeats(double beats) const {
-    const std::vector<SigRegion> regions = regionsOf(*this);
-    const SigRegion* chosen = &regions.front();
-    for (const SigRegion& region : regions) {
+    ensureRegions();
+    const Region* chosen = &regions_.front();
+    for (const Region& region : regions_) {
         if (beats >= region.startBeat) {
             chosen = &region;
         }
@@ -237,20 +262,16 @@ double WarpMap::contentAt(double time) const {
         const double slope = (points[1].contentTime - points[0].contentTime) / span;
         return points.front().contentTime + (time - points.front().time) * slope;
     }
-    const WarpPoint* previous = &points.front();
-    for (size_t pointIndex = 1; pointIndex < points.size(); ++pointIndex) {
-        const WarpPoint& next = points[pointIndex];
-        if (time <= next.time || pointIndex + 1 == points.size()) {
-            const double span = next.time - previous->time;
-            if (std::abs(span) < 1.0e-12) {
-                return next.contentTime;
-            }
-            const double slope = (next.contentTime - previous->contentTime) / span;
-            return previous->contentTime + (time - previous->time) * slope;
-        }
-        previous = &next;
+    const auto upper = std::upper_bound(points.begin(), points.end(), time,
+                                         [](double query, const WarpPoint& point) { return query < point.time; });
+    const WarpPoint& next = upper == points.end() ? points.back() : *upper;
+    const WarpPoint& previous = upper == points.begin() ? points.front() : *(upper - 1);
+    const double span = next.time - previous.time;
+    if (std::abs(span) < 1.0e-12) {
+        return next.contentTime;
     }
-    return points.back().contentTime;
+    const double slope = (next.contentTime - previous.contentTime) / span;
+    return previous.contentTime + (time - previous.time) * slope;
 }
 
 const char* stretchPresetName(StretchPreset preset) {

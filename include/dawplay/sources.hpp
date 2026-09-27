@@ -70,38 +70,69 @@ private:
     };
     struct Decoded {
         std::vector<std::uint8_t> compressed;
+        Mapped sourceMap;
+        const std::uint8_t* bytes = nullptr;
+        size_t byteCount = 0;
         int channels = 0;
         int sampleRate = 0;
         void* decoder = nullptr;
     };
     struct Block {
-        std::string key;
+        int fileId = -1;
         std::int64_t index = 0;
         int rate = 0;
         int channels = 0;
         std::vector<std::int16_t> pcm;
-        double anchor = 0;
-        bool pinned = false;
+        double anchor = 1.0e300;
+        double touchedAt = 0;
+        bool occupied = false;
+    };
+    // Deflated WAV on WASM. The zip entry is not random-access, so an inflate cursor
+    // pulls only the frames a cache block needs instead of keeping the whole PCM.
+    struct ZipWav {
+        int entryIndex = -1;
+        int fileId = -1;
+        void* iter = nullptr;
+        std::uint64_t cursor = 0;
+        std::uint64_t dataOffset = 0;
+        std::uint64_t pcmBytes = 0;
+        int channels = 0;
+        int sampleRate = 0;
+        int bits = 16;
+        bool floating = false;
+        bool headerReady = false;
     };
 
-    std::string fileKey(const FileRef& file) const;
+    int identify(const FileRef& file);
     bool mapFile(const std::string& path, Mapped& mapped, std::string& error);
     WavView* wavFor(const FileRef& file, std::string& error);
+    ZipWav* zipWavFor(const FileRef& file, std::string& error);
     Decoded* decodedFor(const FileRef& file, std::string& error);
     bool readWav(const WavView& wav, int outputRate, std::int64_t sourceFrame, float* interleaved, int frameCount,
                  int channelCount);
-    bool readCached(const FileRef& file, Decoded& decoded, int outputRate, std::int64_t sourceFrame,
-                    float* interleaved, int frameCount, int channelCount, bool& cacheMiss);
+    bool readCached(int fileId, Decoded* decoded, ZipWav* zipWav, int outputRate, std::int64_t sourceFrame,
+                    float* interleaved, int frameCount, int channelCount, bool& cacheMiss, std::string& error);
+    bool fillBlock(Decoded* decoded, ZipWav* zipWav, Block& block, std::string& error);
     void evict(size_t incomingBytes);
+    Block* claimBlock(int fileId, std::int64_t index, int rate, int channels, size_t bytes);
+    void releaseBlock(Block& block);
+    const Block* findBlock(int fileId, int rate, std::int64_t index) const;
+    bool zipRead(ZipWav& wav, std::uint64_t offset, std::uint8_t* destination, size_t bytes);
+    bool zipPrepare(ZipWav& wav, std::string& error);
+    void zipRestart(ZipWav& wav);
     static bool parseWav(const std::uint8_t* data, size_t size, WavView& wav, std::string& error);
 
     mutable std::mutex mutex_;
     Mapped archive_;
     std::string label_;
     void* zip_ = nullptr;
-    std::vector<std::pair<std::string, WavView>> wavs_;
-    std::vector<std::pair<std::string, Decoded>> decoded_;
+    std::vector<std::string> keys_;
+    std::vector<std::pair<int, WavView>> wavs_;
+    std::vector<std::pair<int, Decoded>> decoded_;
+    std::vector<ZipWav> zipWavs_;
     std::vector<Block> blocks_;
+    std::vector<float> decodeScratch_;
+    std::vector<std::uint8_t> byteScratch_;
     size_t budget_ = kDefaultBudget;
     size_t used_ = 0;
     std::vector<std::string> tempFiles_;

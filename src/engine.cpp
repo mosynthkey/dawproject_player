@@ -17,6 +17,9 @@
 #if defined(__linux__)
 #include <unistd.h>
 #endif
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
 #if defined(__EMSCRIPTEN__)
 #include <emscripten.h>
 #endif
@@ -65,6 +68,13 @@ size_t residentBytes() {
     }
     std::fclose(status);
     return bytes;
+#elif defined(__APPLE__)
+    task_basic_info_data_t info;
+    mach_msg_type_number_t count = TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_BASIC_INFO, reinterpret_cast<task_info_t>(&info), &count) != KERN_SUCCESS) {
+        return 0;
+    }
+    return static_cast<size_t>(info.resident_size);
 #elif defined(__EMSCRIPTEN__)
     return static_cast<size_t>(emscripten_get_heap_size());
 #else
@@ -233,20 +243,72 @@ struct Engine::Ring {
 
 struct Engine::Voice {
     int eventIndex = -1;
+    int stretchSlot = -1;
+    int channels = 1;
     std::atomic<bool> stretching{false};
     std::atomic<bool> active{false};
-    std::unique_ptr<signalsmith::stretch::SignalsmithStretch<float>> stretch;
-    int channels = 1;
+    // Audio thread sets this after it has finished draining a retired voice.
+    // The fill thread reuses the voice only after observing it.
+    std::atomic<bool> drained{true};
     Ring ring;
     bool primed = false;
+    bool haveTail = false;
+    float tailLeft = 0;
+    float tailRight = 0;
     double sourceCursor = 0;
     std::atomic<std::int64_t> readFrame{0};
     std::int64_t writeFrame = 0;
-    size_t stretchBytes = 0;
     std::vector<float> inputPlanar;
     std::vector<float> outputPlanar;
     std::vector<float> interleaved;
 };
+
+struct Engine::StretchPool {
+    struct Slot {
+        std::unique_ptr<signalsmith::stretch::SignalsmithStretch<float>> stretch;
+        int channels = 0;
+        int rate = 0;
+        int preset = -1;
+        bool used = false;
+        size_t bytes = 0;
+    };
+    std::vector<Slot> slots;
+};
+
+namespace {
+
+void growFloats(std::vector<float>& buffer, size_t size) {
+    if (buffer.size() < size) {
+        buffer.resize(size);
+    }
+}
+
+void rememberTail(const float* interleaved, int frames, int channels, float& tailLeft, float& tailRight, bool& haveTail) {
+    if (frames <= 0 || channels <= 0) {
+        return;
+    }
+    const size_t last = static_cast<size_t>(frames - 1) * static_cast<size_t>(channels);
+    tailLeft = interleaved[last];
+    tailRight = channels > 1 ? interleaved[last + 1] : tailLeft;
+    haveTail = true;
+}
+
+void writeFadeOut(float* interleaved, int frames, int channels, float& tailLeft, float& tailRight, bool& haveTail) {
+    const float startLeft = haveTail ? tailLeft : 0.0f;
+    const float startRight = haveTail ? tailRight : startLeft;
+    for (int frame = 0; frame < frames; ++frame) {
+        const float gain = 1.0f - static_cast<float>(frame + 1) / static_cast<float>(std::max(frames, 1));
+        interleaved[static_cast<size_t>(frame) * static_cast<size_t>(channels)] = startLeft * gain;
+        if (channels > 1) {
+            interleaved[static_cast<size_t>(frame) * static_cast<size_t>(channels) + 1] = startRight * gain;
+        }
+    }
+    tailLeft = 0;
+    tailRight = 0;
+    haveTail = true;
+}
+
+}  // namespace
 
 Engine::Engine(std::shared_ptr<AudioStore> store, Project project, EngineSettings settings)
     : store_(std::move(store)),
@@ -256,9 +318,11 @@ Engine::Engine(std::shared_ptr<AudioStore> store, Project project, EngineSetting
       deviceChannels_(std::max(settings.outputChannels, 2)),
       presetCode_(static_cast<int>(settings.preset)),
       hardwareStart_(project_.channels.size()),
-      hardwareWidth_(project_.channels.size()) {
+      hardwareWidth_(project_.channels.size()),
+      stretchPool_(std::make_unique<StretchPool>()) {
     mixOrder_ = mixOrder(project_);
-    voices_.reserve(128);
+    buildSoloMask();
+    voices_.reserve(64);
     for (size_t channelIndex = 0; channelIndex < project_.channels.size(); ++channelIndex) {
         hardwareStart_[channelIndex].store(project_.channels[channelIndex].hardwareStart);
         hardwareWidth_[channelIndex].store(std::max(project_.channels[channelIndex].hardwareWidth, 1));
@@ -319,7 +383,11 @@ void Engine::seekBar(double bar) {
 }
 
 double Engine::positionSeconds() const {
-    return static_cast<double>(playhead_.load()) / static_cast<double>(outputRate_);
+    const std::uint64_t seek = seekId_.load(std::memory_order_acquire);
+    if (appliedSeek_.load(std::memory_order_acquire) != seek) {
+        return static_cast<double>(seekFrame_.load(std::memory_order_relaxed)) / static_cast<double>(outputRate_);
+    }
+    return static_cast<double>(playhead_.load(std::memory_order_relaxed)) / static_cast<double>(outputRate_);
 }
 
 double Engine::positionBeats() const { return project_.tempo.beatsAtSeconds(positionSeconds()); }
@@ -342,6 +410,8 @@ void Engine::prepareMixBuffers() {
     post_.assign(static_cast<size_t>(frames) * 2, 0.0f);
     popped_.assign(static_cast<size_t>(frames) * 2, 0.0f);
     discard_.assign(static_cast<size_t>(frames) * 2, 0.0f);
+    beatClock_.assign(static_cast<size_t>(frames), 0.0);
+    secondClock_.assign(static_cast<size_t>(frames), 0.0);
 }
 
 void Engine::noteCallback(std::uint64_t nanoseconds, std::uint32_t frames) {
@@ -377,8 +447,123 @@ void Engine::setHardwareOutput(int channelIndex, int startChannel, int width) {
 }
 
 void Engine::requestSeek(std::int64_t frame) {
-    playhead_.store(std::max<std::int64_t>(frame, 0));
-    seekId_.fetch_add(1);
+    seekFrame_.store(std::max<std::int64_t>(frame, 0), std::memory_order_relaxed);
+    seekId_.fetch_add(1, std::memory_order_release);
+}
+
+void Engine::applyPendingSeek() {
+    const std::uint64_t seek = seekId_.load(std::memory_order_acquire);
+    if (appliedSeek_.load(std::memory_order_relaxed) == seek) {
+        return;
+    }
+    // The device callback acks before it stops touching rings. Render runs both
+    // sides on this thread, so it does not wait.
+    const bool consumerRunning = deviceOpen_ && !inlineFill_;
+    if (consumerRunning && audioSeekAck_.load(std::memory_order_acquire) != seek) {
+        return;
+    }
+    const std::int64_t frame = seekFrame_.load(std::memory_order_relaxed);
+    playhead_.store(frame, std::memory_order_relaxed);
+    for (const auto& voice : voices_) {
+        voice->ring.clear();
+        voice->primed = false;
+        voice->haveTail = false;
+        voice->readFrame.store(frame, std::memory_order_relaxed);
+        voice->writeFrame = frame;
+    }
+    appliedSeek_.store(seek, std::memory_order_release);
+}
+
+void Engine::buildSoloMask() {
+    const int count = static_cast<int>(project_.channels.size());
+    soloPlay_.assign(static_cast<size_t>(count), 1);
+    if (!project_.anySolo()) {
+        return;
+    }
+    std::fill(soloPlay_.begin(), soloPlay_.end(), 0);
+    for (int channelIndex = 0; channelIndex < count; ++channelIndex) {
+        if (project_.channels[static_cast<size_t>(channelIndex)].solo) {
+            soloPlay_[static_cast<size_t>(channelIndex)] = 1;
+        }
+    }
+    bool grew = true;
+    while (grew) {
+        grew = false;
+        for (int channelIndex = 0; channelIndex < count; ++channelIndex) {
+            const int destination = project_.channels[static_cast<size_t>(channelIndex)].destination;
+            if (soloPlay_[static_cast<size_t>(channelIndex)] == 0 && destination >= 0 && destination < count &&
+                soloPlay_[static_cast<size_t>(destination)] != 0) {
+                soloPlay_[static_cast<size_t>(channelIndex)] = 1;
+                grew = true;
+            }
+        }
+    }
+}
+
+void Engine::discardVoices() {
+    for (const auto& voice : voices_) {
+        releaseStretch(*voice);
+    }
+    publishedVoices_.store(0, std::memory_order_release);
+    voices_.clear();
+}
+
+int Engine::acquireStretch(int channels) {
+    StretchPool& pool = *stretchPool_;
+    for (int slotIndex = 0; slotIndex < static_cast<int>(pool.slots.size()); ++slotIndex) {
+        if (!pool.slots[static_cast<size_t>(slotIndex)].used) {
+            pool.slots[static_cast<size_t>(slotIndex)].used = true;
+            (void)channels;
+            return slotIndex;
+        }
+    }
+    if (static_cast<int>(pool.slots.size()) >= kMaxStretchers) {
+        return -1;
+    }
+    StretchPool::Slot slot;
+    slot.stretch = std::make_unique<signalsmith::stretch::SignalsmithStretch<float>>(1);
+    slot.used = true;
+    pool.slots.push_back(std::move(slot));
+    return static_cast<int>(pool.slots.size()) - 1;
+}
+
+void Engine::releaseStretch(Voice& voice) {
+    if (voice.stretchSlot < 0) {
+        return;
+    }
+    stretchPool_->slots[static_cast<size_t>(voice.stretchSlot)].used = false;
+    voice.stretchSlot = -1;
+    voice.primed = false;
+}
+
+void Engine::configureStretch(Voice& voice) {
+    if (voice.stretchSlot < 0) {
+        return;
+    }
+    StretchPool::Slot& slot = stretchPool_->slots[static_cast<size_t>(voice.stretchSlot)];
+    const int preset = presetCode_.load(std::memory_order_relaxed);
+    if (slot.channels == voice.channels && slot.rate == outputRate_ && slot.preset == preset && slot.stretch != nullptr) {
+        return;
+    }
+    if (preset == static_cast<int>(StretchPreset::Default)) {
+        slot.stretch->presetDefault(voice.channels, static_cast<float>(outputRate_));
+    } else {
+        slot.stretch->presetCheaper(voice.channels, static_cast<float>(outputRate_));
+    }
+    slot.channels = voice.channels;
+    slot.rate = outputRate_;
+    slot.preset = preset;
+    slot.bytes = estimateStretchBytes(*slot.stretch, voice.channels);
+    voice.primed = false;
+}
+
+double Engine::transposeAt(const AudioEvent& event, double arrangementSecond) const {
+    double transpose = 0;
+    for (const LayerAutomation& automation : event.automation) {
+        const double content = event.contentTime(project_.tempo, arrangementSecond, automation.layer);
+        transpose += automation.transpose.valueAt(content);
+    }
+    return transpose;
 }
 
 int Engine::channelCountFor(const AudioEvent& event) const {
@@ -394,88 +579,126 @@ void Engine::ensureVoices() {
     const std::int64_t playhead = playhead_.load();
     const double now = static_cast<double>(playhead) / static_cast<double>(outputRate_);
     const double horizon = now + 0.20;
-    int stretching = 0;
-    for (const auto& voice : voices_) {
-        if (voice->active.load() && voice->stretching.load()) {
-            ++stretching;
-        }
-        voice->active.store(false);
+    const int fifoFrames = std::max(outputRate_ * 150 / 1000, kProduceFrames * 2);
+    if (voiceKeep_.size() < voices_.size()) {
+        voiceKeep_.resize(voices_.size());
     }
+    std::fill_n(voiceKeep_.begin(), voices_.size(), 0);
+
     for (int eventIndex = 0; eventIndex < static_cast<int>(project_.events.size()); ++eventIndex) {
         const AudioEvent& event = project_.events[static_cast<size_t>(eventIndex)];
         if (event.endSecond < now || event.startSecond > horizon) {
             continue;
         }
-        Voice* existing = nullptr;
-        for (const auto& voice : voices_) {
-            if (voice->eventIndex == eventIndex) {
-                existing = voice.get();
+        int voiceIndex = -1;
+        for (int index = 0; index < static_cast<int>(voices_.size()); ++index) {
+            if (voices_[static_cast<size_t>(index)]->eventIndex == eventIndex) {
+                voiceIndex = index;
                 break;
             }
         }
-        if (existing == nullptr) {
+        bool claimed = false;
+        if (voiceIndex < 0) {
+            for (int index = 0; index < static_cast<int>(voices_.size()); ++index) {
+                Voice* candidate = voices_[static_cast<size_t>(index)].get();
+                if (candidate->drained.load(std::memory_order_acquire) && !candidate->active.load(std::memory_order_acquire)) {
+                    voiceIndex = index;
+                    claimed = true;
+                    break;
+                }
+            }
+        }
+        if (voiceIndex < 0) {
             if (static_cast<int>(voices_.size()) >= 64) {
                 continue;
             }
             voices_.push_back(std::make_unique<Voice>());
-            existing = voices_.back().get();
-            existing->eventIndex = eventIndex;
-            existing->channels = channelCountFor(event);
-            const int fifoFrames = std::max(outputRate_ * 150 / 1000, kProduceFrames * 2);
-            existing->ring.configure(existing->channels, fifoFrames);
-            existing->readFrame.store(playhead);
-            existing->writeFrame = playhead;
-            publishedVoices_.store(static_cast<int>(voices_.size()), std::memory_order_release);
+            voiceKeep_.push_back(0);
+            voiceIndex = static_cast<int>(voices_.size()) - 1;
+            claimed = true;
+            Voice* created = voices_.back().get();
+            created->drained.store(false, std::memory_order_relaxed);
+            created->channels = channelCountFor(event);
+            created->eventIndex = eventIndex;
+            created->ring.configure(created->channels, fifoFrames);
+            created->readFrame.store(playhead, std::memory_order_relaxed);
+            created->writeFrame = playhead;
+        }
+        Voice* voice = voices_[static_cast<size_t>(voiceIndex)].get();
+        if (claimed && voice->eventIndex != eventIndex) {
+            voice->drained.store(false, std::memory_order_relaxed);
+            releaseStretch(*voice);
+            voice->eventIndex = eventIndex;
+            const int channels = channelCountFor(event);
+            if (voice->channels != channels) {
+                voice->channels = channels;
+                voice->ring.configure(voice->channels, fifoFrames);
+            }
+            voice->ring.clear();
+            voice->primed = false;
+            voice->haveTail = false;
+            voice->readFrame.store(playhead, std::memory_order_relaxed);
+            voice->writeFrame = playhead;
         }
         double source = 0;
         double later = 0;
         const double sampleStart = std::max(now, event.startSecond);
         const double sampleEnd = std::min(horizon, event.endSecond);
         const bool audible = event.sourceAt(project_.tempo, sampleStart, source);
-        if (sampleEnd > sampleStart) {
-            event.sourceAt(project_.tempo, sampleEnd, later);
-        } else {
-            later = source;
-        }
+        const bool haveLater = sampleEnd > sampleStart && event.sourceAt(project_.tempo, sampleEnd, later);
         const double span = sampleEnd - sampleStart;
-        const double ratio = audible && span > 1.0e-4 ? (later - source) / span : 1.0;
-        const double transpose = event.automation.empty() ? 0.0 : event.automation.front().transpose.valueAt(0);
-        const bool needStretch = eventNeedsStretch(event, ratio, transpose);
-        if (needStretch && !existing->stretching && stretching >= kMaxStretchers) {
+        const double ratio = audible && haveLater && span > 1.0e-4 ? (later - source) / span : 1.0;
+        const bool needStretch = eventNeedsStretch(event, ratio, transposeAt(event, sampleStart));
+        if (needStretch && voice->stretchSlot < 0) {
+            voice->stretchSlot = acquireStretch(voice->channels);
+            if (voice->stretchSlot < 0) {
+                voice->active.store(false, std::memory_order_release);
+                voice->stretching.store(false, std::memory_order_relaxed);
+                if (voice->ring.filled() == 0) {
+                    voice->eventIndex = -1;
+                    voice->drained.store(true, std::memory_order_release);
+                }
+                continue;
+            }
+        }
+        if (!needStretch) {
+            releaseStretch(*voice);
+        }
+        voice->stretching.store(needStretch, std::memory_order_relaxed);
+        voice->active.store(true, std::memory_order_release);
+        voiceKeep_[static_cast<size_t>(voiceIndex)] = 1;
+    }
+    for (int index = 0; index < static_cast<int>(voices_.size()); ++index) {
+        if (voiceKeep_[static_cast<size_t>(index)] != 0) {
             continue;
         }
-        if (needStretch && !existing->stretching) {
-            ++stretching;
+        Voice* voice = voices_[static_cast<size_t>(index)].get();
+        if (voice->active.load(std::memory_order_relaxed)) {
+            voice->active.store(false, std::memory_order_release);
+            voice->stretching.store(false, std::memory_order_relaxed);
+            releaseStretch(*voice);
+            voice->primed = false;
         }
-        existing->stretching.store(needStretch);
-        existing->active.store(true);
     }
+    publishedVoices_.store(static_cast<int>(voices_.size()), std::memory_order_release);
 }
 
 void Engine::fillAhead() {
-    const std::uint64_t seek = seekId_.load();
-    if (appliedSeek_.load() != seek) {
-        for (const auto& voice : voices_) {
-            voice->ring.clear();
-            voice->primed = false;
-            voice->readFrame.store(playhead_.load());
-            voice->writeFrame = playhead_.load();
-        }
-        appliedSeek_.store(seek);
-    }
+    applyPendingSeek();
     ensureVoices();
     const std::int64_t playhead = playhead_.load();
     const int targetAhead = std::max(outputRate_ * 120 / 1000, kProduceFrames);
-    const int epoch = presetEpoch_.load();
     for (const auto& voice : voices_) {
         if (!voice->active.load()) {
             continue;
         }
-        if (voice->writeFrame + voice->ring.filled() < playhead) {
-            voice->ring.clear();
+        if (voice->writeFrame < playhead) {
+            if (voice->ring.filled() > 0) {
+                continue;
+            }
             voice->primed = false;
             voice->writeFrame = playhead;
-            voice->readFrame.store(playhead);
+            voice->readFrame.store(playhead, std::memory_order_relaxed);
         }
         const AudioEvent& event = project_.events[static_cast<size_t>(voice->eventIndex)];
         const std::int64_t eventEnd = static_cast<std::int64_t>(std::llround(event.endSecond * outputRate_));
@@ -487,7 +710,9 @@ void Engine::fillAhead() {
             double sourceEnd = 0;
             if (!event.sourceAt(project_.tempo, t0, sourceStart) || !event.sourceAt(project_.tempo, t1, sourceEnd) ||
                 sourceEnd + 1.0e-6 < sourceStart) {
-                voice->interleaved.assign(static_cast<size_t>(frames) * static_cast<size_t>(voice->channels), 0.0f);
+                growFloats(voice->interleaved, static_cast<size_t>(frames) * static_cast<size_t>(voice->channels));
+                writeFadeOut(voice->interleaved.data(), frames, voice->channels, voice->tailLeft, voice->tailRight,
+                             voice->haveTail);
                 voice->ring.push(voice->interleaved.data(), frames);
                 voice->writeFrame += frames;
                 voice->primed = false;
@@ -506,74 +731,85 @@ void Engine::fillAhead() {
             }
             const auto sourceFrame = static_cast<std::int64_t>(std::llround(sourceStart * outputRate_));
             if (!needStretch) {
-                voice->interleaved.resize(static_cast<size_t>(frames) * static_cast<size_t>(voice->channels));
+                growFloats(voice->interleaved, static_cast<size_t>(frames) * static_cast<size_t>(voice->channels));
                 bool cacheMiss = false;
                 const bool served = store_->readFrames(event.file, outputRate_, sourceFrame, voice->interleaved.data(), frames,
                                                        voice->channels, cacheMiss);
                 if (!served || cacheMiss) {
-                    std::fill(voice->interleaved.begin(), voice->interleaved.end(), 0.0f);
+                    writeFadeOut(voice->interleaved.data(), frames, voice->channels, voice->tailLeft, voice->tailRight,
+                                 voice->haveTail);
+                } else {
+                    rememberTail(voice->interleaved.data(), frames, voice->channels, voice->tailLeft, voice->tailRight,
+                                 voice->haveTail);
                 }
                 voice->ring.push(voice->interleaved.data(), frames);
                 voice->writeFrame += frames;
                 continue;
             }
-            if (voice->stretch == nullptr || voice->stretch->inputLatency() < 0) {
-                voice->stretch = std::make_unique<signalsmith::stretch::SignalsmithStretch<float>>(1);
+            if (voice->stretchSlot < 0) {
+                voice->stretchSlot = acquireStretch(voice->channels);
             }
-            if (!voice->primed || epoch != 0) {
-                if (preset() == StretchPreset::Default) {
-                    voice->stretch->presetDefault(voice->channels, static_cast<float>(outputRate_));
-                } else {
-                    voice->stretch->presetCheaper(voice->channels, static_cast<float>(outputRate_));
-                }
-                voice->stretchBytes = estimateStretchBytes(*voice->stretch, voice->channels);
+            if (voice->stretchSlot < 0) {
+                growFloats(voice->interleaved, static_cast<size_t>(frames) * static_cast<size_t>(voice->channels));
+                writeFadeOut(voice->interleaved.data(), frames, voice->channels, voice->tailLeft, voice->tailRight,
+                             voice->haveTail);
+                voice->ring.push(voice->interleaved.data(), frames);
+                voice->writeFrame += frames;
+                continue;
+            }
+            configureStretch(*voice);
+            auto* stretch = stretchPool_->slots[static_cast<size_t>(voice->stretchSlot)].stretch.get();
+            if (!voice->primed) {
                 const double safeRatio = std::clamp(ratio, 0.05, 8.0);
-                const int seekLength = std::max(voice->stretch->outputSeekLength(static_cast<float>(safeRatio)), 1);
-                voice->interleaved.assign(static_cast<size_t>(seekLength) * static_cast<size_t>(voice->channels), 0.0f);
+                const int seekLength = std::max(stretch->outputSeekLength(static_cast<float>(safeRatio)), 1);
+                growFloats(voice->interleaved, static_cast<size_t>(seekLength) * static_cast<size_t>(voice->channels));
                 bool cacheMiss = false;
-                store_->readFrames(event.file, outputRate_, sourceFrame, voice->interleaved.data(), seekLength, voice->channels,
-                                   cacheMiss);
-                voice->inputPlanar.resize(static_cast<size_t>(seekLength) * static_cast<size_t>(voice->channels));
+                const bool primedRead = store_->readFrames(event.file, outputRate_, sourceFrame, voice->interleaved.data(),
+                                                           seekLength, voice->channels, cacheMiss);
+                if (!primedRead || cacheMiss) {
+                    growFloats(voice->interleaved, static_cast<size_t>(frames) * static_cast<size_t>(voice->channels));
+                    writeFadeOut(voice->interleaved.data(), frames, voice->channels, voice->tailLeft, voice->tailRight,
+                                 voice->haveTail);
+                    voice->ring.push(voice->interleaved.data(), frames);
+                    voice->writeFrame += frames;
+                    continue;
+                }
+                growFloats(voice->inputPlanar, static_cast<size_t>(seekLength) * static_cast<size_t>(voice->channels));
                 interleaveToPlanar(voice->interleaved.data(), voice->inputPlanar.data(), seekLength, voice->channels);
-                voice->stretch->setTransposeSemitones(static_cast<float>(transpose));
+                stretch->setTransposeSemitones(static_cast<float>(transpose));
                 Planar input{voice->inputPlanar.data(), seekLength};
-                voice->stretch->outputSeek(input, seekLength);
+                stretch->outputSeek(input, seekLength);
                 voice->sourceCursor = static_cast<double>(sourceFrame + seekLength);
                 voice->primed = true;
             }
-            voice->stretch->setTransposeSemitones(static_cast<float>(transpose));
+            stretch->setTransposeSemitones(static_cast<float>(transpose));
             const int inputFrames = std::max(1, static_cast<int>(std::llround(std::clamp(ratio, 0.05, 8.0) * frames)));
-            voice->interleaved.assign(static_cast<size_t>(inputFrames) * static_cast<size_t>(voice->channels), 0.0f);
+            growFloats(voice->interleaved, static_cast<size_t>(inputFrames) * static_cast<size_t>(voice->channels));
             bool cacheMiss = false;
             const auto cursorFrame = static_cast<std::int64_t>(std::llround(voice->sourceCursor));
-            store_->readFrames(event.file, outputRate_, cursorFrame, voice->interleaved.data(), inputFrames, voice->channels,
-                               cacheMiss);
-            voice->inputPlanar.resize(static_cast<size_t>(inputFrames) * static_cast<size_t>(voice->channels));
-            voice->outputPlanar.assign(static_cast<size_t>(frames) * static_cast<size_t>(voice->channels), 0.0f);
-            interleaveToPlanar(voice->interleaved.data(), voice->inputPlanar.data(), inputFrames, voice->channels);
-            Planar input{voice->inputPlanar.data(), inputFrames};
-            Planar output{voice->outputPlanar.data(), frames};
-            voice->stretch->process(input, inputFrames, output, frames);
-            voice->interleaved.resize(static_cast<size_t>(frames) * static_cast<size_t>(voice->channels));
-            planarToInterleave(voice->outputPlanar.data(), voice->interleaved.data(), frames, voice->channels);
-            if (cacheMiss) {
-                const int fade = std::min(frames, 64);
-                for (int frame = 0; frame < fade; ++frame) {
-                    const float gain = 1.0f - static_cast<float>(frame) / static_cast<float>(fade);
-                    for (int channel = 0; channel < voice->channels; ++channel) {
-                        voice->interleaved[static_cast<size_t>(frame) * static_cast<size_t>(voice->channels) +
-                                           static_cast<size_t>(channel)] *= gain;
-                    }
-                }
+            const bool served = store_->readFrames(event.file, outputRate_, cursorFrame, voice->interleaved.data(), inputFrames,
+                                                   voice->channels, cacheMiss);
+            if (!served || cacheMiss) {
+                growFloats(voice->interleaved, static_cast<size_t>(frames) * static_cast<size_t>(voice->channels));
+                writeFadeOut(voice->interleaved.data(), frames, voice->channels, voice->tailLeft, voice->tailRight,
+                             voice->haveTail);
+                voice->primed = false;
+            } else {
+                growFloats(voice->inputPlanar, static_cast<size_t>(inputFrames) * static_cast<size_t>(voice->channels));
+                growFloats(voice->outputPlanar, static_cast<size_t>(frames) * static_cast<size_t>(voice->channels));
+                interleaveToPlanar(voice->interleaved.data(), voice->inputPlanar.data(), inputFrames, voice->channels);
+                Planar input{voice->inputPlanar.data(), inputFrames};
+                Planar output{voice->outputPlanar.data(), frames};
+                stretch->process(input, inputFrames, output, frames);
+                growFloats(voice->interleaved, static_cast<size_t>(frames) * static_cast<size_t>(voice->channels));
+                planarToInterleave(voice->outputPlanar.data(), voice->interleaved.data(), frames, voice->channels);
+                rememberTail(voice->interleaved.data(), frames, voice->channels, voice->tailLeft, voice->tailRight,
+                             voice->haveTail);
             }
             voice->ring.push(voice->interleaved.data(), frames);
             voice->sourceCursor += inputFrames;
             voice->writeFrame += frames;
         }
-    }
-    if (epoch != 0) {
-        int seen = epoch;
-        presetEpoch_.compare_exchange_strong(seen, 0);
     }
 }
 
@@ -581,6 +817,8 @@ void Engine::fillLoop() {
     while (!stopThread_.load()) {
         if (playing_.load() || inlineFill_) {
             fillAhead();
+        } else {
+            applyPendingSeek();
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(playing_.load() ? 2 : 10));
     }
@@ -594,13 +832,21 @@ void Engine::mixBlock(float* deviceOut, int frameCount, bool advance) {
         return;
     }
     std::fill_n(buses_.begin(), channelCount * static_cast<size_t>(busChannels) * static_cast<size_t>(frames), 0.0f);
-    const bool solo = project_.anySolo();
     const std::int64_t origin = playhead_.load();
     if (appliedSeek_.load() == seekId_.load()) {
         const int voiceCount = publishedVoices_.load(std::memory_order_acquire);
         for (int voiceIndex = 0; voiceIndex < voiceCount; ++voiceIndex) {
             Voice* voice = voices_[static_cast<size_t>(voiceIndex)].get();
-            if (!voice->active.load() && voice->ring.filled() == 0) {
+            const bool voiceActive = voice->active.load(std::memory_order_acquire);
+            if (!voiceActive) {
+                if (voice->drained.load(std::memory_order_acquire) || voice->ring.filled() == 0) {
+                    if (voice->ring.filled() == 0) {
+                        voice->drained.store(true, std::memory_order_release);
+                    }
+                    continue;
+                }
+            }
+            if (voice->eventIndex < 0) {
                 continue;
             }
             const AudioEvent& event = project_.events[static_cast<size_t>(voice->eventIndex)];
@@ -608,7 +854,8 @@ void Engine::mixBlock(float* deviceOut, int frameCount, bool advance) {
                 continue;
             }
             const MixerChannel& channel = project_.channels[static_cast<size_t>(event.channelIndex)];
-            if (!channel.audible || (solo && !channel.solo)) {
+            if (!channel.audible ||
+                (event.channelIndex < static_cast<int>(soloPlay_.size()) && soloPlay_[static_cast<size_t>(event.channelIndex)] == 0)) {
                 continue;
             }
             std::int64_t readFrame = voice->readFrame.load();
@@ -682,19 +929,26 @@ void Engine::mixBlock(float* deviceOut, int frameCount, bool advance) {
             }
         }
     }
+    for (int frame = 0; frame < frames; ++frame) {
+        secondClock_[static_cast<size_t>(frame)] = static_cast<double>(origin + frame) / static_cast<double>(outputRate_);
+        beatClock_[static_cast<size_t>(frame)] = project_.tempo.beatsAtSeconds(secondClock_[static_cast<size_t>(frame)]);
+    }
     for (int channelIndex : mixOrder_) {
         const MixerChannel& channel = project_.channels[static_cast<size_t>(channelIndex)];
         float* bus = buses_.data() + static_cast<size_t>(channelIndex) * static_cast<size_t>(busChannels) *
                                           static_cast<size_t>(frames);
-        const double beats = project_.tempo.beatsAtSeconds(static_cast<double>(origin) / outputRate_);
-        const double seconds = static_cast<double>(origin) / outputRate_;
-        const double volume = channel.volume.valueAt(beats);
-        const double pan = channel.pan.valueAt(beats);
-        const bool muted = channel.mute.valueAt(beats) >= 0.5 || channel.mute.valueAt(seconds) >= 0.5;
-        const float angle = std::clamp(static_cast<float>(pan), 0.0f, 1.0f) * 1.5707963f;
-        const float leftGain = muted ? 0.0f : static_cast<float>(volume) * std::cos(angle);
-        const float rightGain = muted ? 0.0f : static_cast<float>(volume) * std::sin(angle);
         for (int frame = 0; frame < frames; ++frame) {
+            const double seconds = secondClock_[static_cast<size_t>(frame)];
+            const double beats = beatClock_[static_cast<size_t>(frame)];
+            const auto clockOf = [&](const AutomationCurve& curve) {
+                return curve.timeUnit == TimeUnit::Seconds ? seconds : beats;
+            };
+            const double volume = channel.volume.valueAt(clockOf(channel.volume));
+            const double pan = channel.pan.valueAt(clockOf(channel.pan));
+            const bool muted = channel.mute.valueAt(clockOf(channel.mute)) >= 0.5;
+            const float angle = std::clamp(static_cast<float>(pan), 0.0f, 1.0f) * 1.5707963f;
+            const float leftGain = muted ? 0.0f : static_cast<float>(volume) * std::cos(angle);
+            const float rightGain = muted ? 0.0f : static_cast<float>(volume) * std::sin(angle);
             post_[static_cast<size_t>(frame)] = bus[static_cast<size_t>(frame)] * leftGain;
             post_[static_cast<size_t>(frames) + static_cast<size_t>(frame)] =
                 bus[static_cast<size_t>(frames) + static_cast<size_t>(frame)] * rightGain;
@@ -732,13 +986,19 @@ void Engine::mixBlock(float* deviceOut, int frameCount, bool advance) {
             }
         }
     }
-    if (advance && playing_.load()) {
-        playhead_.store(origin + frames);
+    if (advance && playing_.load() && seekId_.load(std::memory_order_acquire) == appliedSeek_.load(std::memory_order_acquire)) {
+        std::int64_t expected = origin;
+        playhead_.compare_exchange_strong(expected, origin + frames, std::memory_order_relaxed);
     }
 }
 
 void Engine::pump(float* output, int frameCount) {
     std::fill(output, output + static_cast<size_t>(frameCount) * static_cast<size_t>(deviceChannels_), 0.0f);
+    const std::uint64_t seek = seekId_.load(std::memory_order_acquire);
+    if (appliedSeek_.load(std::memory_order_acquire) != seek) {
+        audioSeekAck_.store(seek, std::memory_order_release);
+        return;
+    }
     int done = 0;
     while (done < frameCount) {
         const int chunk = std::min(scratchFrames_, frameCount - done);
@@ -795,8 +1055,7 @@ bool Engine::startDevice(std::string& error) {
     outputRate_ = static_cast<int>(device->sampleRate);
     deviceChannels_ = static_cast<int>(device->playback.channels);
     prepareMixBuffers();
-    publishedVoices_.store(0, std::memory_order_release);
-    voices_.clear();
+    discardVoices();
     if (ma_device_start(device) != MA_SUCCESS) {
         ma_device_uninit(device);
         delete device;
@@ -851,8 +1110,7 @@ bool Engine::renderToWav(const RenderRequest& request, std::string& error) {
     }
     deviceChannels_ = channels;
     prepareMixBuffers();
-    publishedVoices_.store(0, std::memory_order_release);
-    voices_.clear();
+    discardVoices();
     playhead_.store(0);
     appliedSeek_.store(seekId_.load());
     ma_encoder encoder;
@@ -924,13 +1182,14 @@ MemoryStats Engine::memory() const {
     stats.cacheBudget = store_->budget();
     stats.modelBytes = project_.modelBytes;
     stats.residentBytes = residentBytes();
+    if (stretchPool_ != nullptr) {
+        for (const StretchPool::Slot& slot : stretchPool_->slots) {
+            stats.stretcherBytes += slot.bytes;
+        }
+    }
     const int voiceCount = publishedVoices_.load(std::memory_order_acquire);
     for (int voiceIndex = 0; voiceIndex < voiceCount; ++voiceIndex) {
         const Voice* voice = voices_[static_cast<size_t>(voiceIndex)].get();
-        if (!voice->active.load() && voice->stretch == nullptr) {
-            continue;
-        }
-        stats.stretcherBytes += voice->stretchBytes;
         stats.fifoBytes += voice->ring.samples.size() * sizeof(float);
         if (voice->active.load() && voice->stretching.load()) {
             ++stats.activeStretchers;

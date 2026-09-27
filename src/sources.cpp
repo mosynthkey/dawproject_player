@@ -7,6 +7,7 @@
 #pragma GCC diagnostic pop
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -92,6 +93,16 @@ AudioStore::~AudioStore() {
             delete decoder;
             entry.second.decoder = nullptr;
         }
+        if (entry.second.sourceMap.data != nullptr && entry.second.sourceMap.ownedMap) {
+#ifndef __EMSCRIPTEN__
+            munmap(entry.second.sourceMap.data, entry.second.sourceMap.size);
+#endif
+        }
+        if (entry.second.sourceMap.fd >= 0) {
+#ifndef __EMSCRIPTEN__
+            close(entry.second.sourceMap.fd);
+#endif
+        }
     }
     if (zip_ != nullptr) {
         mz_zip_reader_end(static_cast<mz_zip_archive*>(zip_));
@@ -108,6 +119,12 @@ AudioStore::~AudioStore() {
 #ifndef __EMSCRIPTEN__
             close(entry.second.tempMap.fd);
 #endif
+        }
+    }
+    for (ZipWav& wav : zipWavs_) {
+        if (wav.iter != nullptr) {
+            mz_zip_reader_extract_iter_free(static_cast<mz_zip_reader_extract_iter_state*>(wav.iter));
+            wav.iter = nullptr;
         }
     }
     for (const std::string& path : tempFiles_) {
@@ -271,29 +288,95 @@ std::string AudioStore::archiveLabel() const {
     return label_;
 }
 
-std::string AudioStore::fileKey(const FileRef& file) const {
-    return (file.external ? "external:" : "zip:") + file.path;
+int AudioStore::identify(const FileRef& file) {
+    if (file.storeId >= 0 && static_cast<size_t>(file.storeId) < keys_.size()) {
+        return file.storeId;
+    }
+    const std::string key = (file.external ? std::string("external:") : std::string("zip:")) + file.path;
+    for (int index = 0; index < static_cast<int>(keys_.size()); ++index) {
+        if (keys_[static_cast<size_t>(index)] == key) {
+            file.storeId = index;
+            return index;
+        }
+    }
+    file.storeId = static_cast<int>(keys_.size());
+    keys_.push_back(key);
+    return file.storeId;
+}
+
+void AudioStore::releaseBlock(Block& block) {
+    if (!block.occupied) {
+        return;
+    }
+    used_ -= block.pcm.size() * sizeof(std::int16_t);
+    block.occupied = false;
+    block.fileId = -1;
+    block.anchor = 1.0e300;
+    block.touchedAt = 0;
 }
 
 void AudioStore::evict(size_t incomingBytes) {
+    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
     while (used_ + incomingBytes > budget_) {
         size_t victim = blocks_.size();
         double farthest = -1;
         for (size_t blockIndex = 0; blockIndex < blocks_.size(); ++blockIndex) {
-            if (blocks_[blockIndex].pinned) {
+            Block& block = blocks_[blockIndex];
+            if (!block.occupied) {
                 continue;
             }
-            if (blocks_[blockIndex].anchor > farthest) {
-                farthest = blocks_[blockIndex].anchor;
+            // Touched inside the look-ahead window. Two engines share this cache, so a
+            // block stays pinned until it ages out instead of being cleared per read.
+            if (now - block.touchedAt < 0.25) {
+                continue;
+            }
+            if (block.anchor > farthest) {
+                farthest = block.anchor;
                 victim = blockIndex;
             }
         }
         if (victim == blocks_.size()) {
             return;
         }
-        used_ -= blocks_[victim].pcm.size() * sizeof(std::int16_t);
-        blocks_.erase(blocks_.begin() + static_cast<std::ptrdiff_t>(victim));
+        releaseBlock(blocks_[victim]);
     }
+}
+
+AudioStore::Block* AudioStore::claimBlock(int fileId, std::int64_t index, int rate, int channels, size_t bytes) {
+    evict(bytes);
+    if (used_ + bytes > budget_) {
+        return nullptr;
+    }
+    Block* block = nullptr;
+    for (Block& candidate : blocks_) {
+        if (!candidate.occupied) {
+            block = &candidate;
+            break;
+        }
+    }
+    if (block == nullptr) {
+        blocks_.emplace_back();
+        block = &blocks_.back();
+    }
+    block->pcm.resize(bytes / sizeof(std::int16_t));
+    block->fileId = fileId;
+    block->index = index;
+    block->rate = rate;
+    block->channels = channels;
+    block->occupied = true;
+    block->anchor = 0;
+    block->touchedAt = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    used_ += block->pcm.size() * sizeof(std::int16_t);
+    return block;
+}
+
+const AudioStore::Block* AudioStore::findBlock(int fileId, int rate, std::int64_t index) const {
+    for (const Block& block : blocks_) {
+        if (block.occupied && block.fileId == fileId && block.rate == rate && block.index == index) {
+            return &block;
+        }
+    }
+    return nullptr;
 }
 
 namespace {
@@ -315,9 +398,9 @@ int locateEntry(mz_zip_archive* zip, const std::string& path) {
 }  // namespace
 
 AudioStore::WavView* AudioStore::wavFor(const FileRef& file, std::string& error) {
-    const std::string key = fileKey(file);
+    const int id = identify(file);
     for (auto& entry : wavs_) {
-        if (entry.first == key) {
+        if (entry.first == id) {
             return &entry.second;
         }
     }
@@ -335,7 +418,7 @@ AudioStore::WavView* AudioStore::wavFor(const FileRef& file, std::string& error)
         if (!parseWav(view.tempMap.data, view.tempMap.size, view, error)) {
             return nullptr;
         }
-        wavs_.emplace_back(key, std::move(view));
+        wavs_.emplace_back(id, std::move(view));
         return &wavs_.back().second;
 #else
         error = "External media is ignored in the web build: " + file.path;
@@ -394,69 +477,211 @@ AudioStore::WavView* AudioStore::wavFor(const FileRef& file, std::string& error)
         if (!mapFile(tempPath, view.tempMap, error) || !parseWav(view.tempMap.data, view.tempMap.size, view, error)) {
             return nullptr;
         }
-        wavs_.emplace_back(key, std::move(view));
+        wavs_.emplace_back(id, std::move(view));
         return &wavs_.back().second;
 #else
-        size_t heapSize = 0;
-        void* heap = mz_zip_reader_extract_to_heap(zip, static_cast<mz_uint>(index), &heapSize, 0);
-        if (heap == nullptr) {
-            error = "Could not inflate " + file.path;
-            return nullptr;
-        }
-        WavView view;
-        view.owned.assign(static_cast<std::uint8_t*>(heap), static_cast<std::uint8_t*>(heap) + heapSize);
-        mz_free(heap);
-        if (!parseWav(view.owned.data(), view.owned.size(), view, error)) {
-            return nullptr;
-        }
-        view.pcm = view.owned.data() + (view.pcm - view.owned.data());
-        wavs_.emplace_back(key, std::move(view));
-        WavView& storedView = wavs_.back().second;
-        // parseWav pointed pcm at the temporary owned buffer address before the move.
-        if (!parseWav(storedView.owned.data(), storedView.owned.size(), storedView, error)) {
-            return nullptr;
-        }
-        return &storedView;
+        // No temp file in the web build. The block cache streams this entry.
+        (void)index;
+        return nullptr;
 #endif
     }
     WavView view;
     if (!parseWav(payload, payloadSize, view, error)) {
         return nullptr;
     }
-    wavs_.emplace_back(key, std::move(view));
+    wavs_.emplace_back(id, std::move(view));
     return &wavs_.back().second;
 }
 
-AudioStore::Decoded* AudioStore::decodedFor(const FileRef& file, std::string& error) {
-    const std::string key = fileKey(file);
-    for (auto& entry : decoded_) {
-        if (entry.first == key) {
-            return &entry.second;
+void AudioStore::zipRestart(ZipWav& wav) {
+    if (wav.iter != nullptr) {
+        mz_zip_reader_extract_iter_free(static_cast<mz_zip_reader_extract_iter_state*>(wav.iter));
+        wav.iter = nullptr;
+    }
+    auto* zip = static_cast<mz_zip_archive*>(zip_);
+    if (zip == nullptr || wav.entryIndex < 0) {
+        return;
+    }
+    wav.iter = mz_zip_reader_extract_iter_new(zip, static_cast<mz_uint>(wav.entryIndex), 0);
+    wav.cursor = 0;
+}
+
+bool AudioStore::zipRead(ZipWav& wav, std::uint64_t offset, std::uint8_t* destination, size_t bytes) {
+    if (wav.iter == nullptr || wav.cursor > offset) {
+        zipRestart(wav);
+    }
+    auto* iter = static_cast<mz_zip_reader_extract_iter_state*>(wav.iter);
+    if (iter == nullptr) {
+        return false;
+    }
+    std::uint8_t discard[4096];
+    while (wav.cursor < offset) {
+        const size_t skip = static_cast<size_t>(std::min<std::uint64_t>(offset - wav.cursor, sizeof(discard)));
+        const size_t got = mz_zip_reader_extract_iter_read(iter, discard, skip);
+        if (got == 0) {
+            return false;
+        }
+        wav.cursor += got;
+    }
+    size_t filled = 0;
+    while (filled < bytes) {
+        const size_t got = mz_zip_reader_extract_iter_read(iter, destination + filled, bytes - filled);
+        if (got == 0) {
+            return false;
+        }
+        filled += got;
+        wav.cursor += got;
+    }
+    return true;
+}
+
+bool AudioStore::zipPrepare(ZipWav& wav, std::string& error) {
+    if (wav.headerReady) {
+        return true;
+    }
+    zipRestart(wav);
+    std::uint8_t lead[12];
+    if (!zipRead(wav, 0, lead, sizeof(lead)) || std::memcmp(lead, "RIFF", 4) != 0 || std::memcmp(lead + 8, "WAVE", 4) != 0) {
+        error = "Deflated entry is not a WAV file";
+        return false;
+    }
+    auto skipBytes = [&](std::uint64_t count) {
+        std::uint8_t discard[4096];
+        while (count > 0) {
+            const size_t step = static_cast<size_t>(std::min<std::uint64_t>(count, sizeof(discard)));
+            if (!zipRead(wav, wav.cursor, discard, step)) {
+                return false;
+            }
+            count -= step;
+        }
+        return true;
+    };
+    bool foundFormat = false;
+    while (true) {
+        std::uint8_t chunk[8];
+        if (!zipRead(wav, wav.cursor, chunk, sizeof(chunk))) {
+            error = "Deflated WAV ended before the data chunk";
+            return false;
+        }
+        const std::uint32_t chunkSize = static_cast<std::uint32_t>(chunk[4]) | (static_cast<std::uint32_t>(chunk[5]) << 8) |
+                                        (static_cast<std::uint32_t>(chunk[6]) << 16) | (static_cast<std::uint32_t>(chunk[7]) << 24);
+        const bool dataChunk = std::memcmp(chunk, "data", 4) == 0;
+        if (std::memcmp(chunk, "fmt ", 4) == 0 && chunkSize >= 16) {
+            std::uint8_t format[16];
+            if (!zipRead(wav, wav.cursor, format, sizeof(format))) {
+                return false;
+            }
+            const int audioFormat = format[0] | (format[1] << 8);
+            wav.channels = format[2] | (format[3] << 8);
+            wav.sampleRate = static_cast<int>(format[4] | (format[5] << 8) | (format[6] << 16) | (format[7] << 24));
+            wav.bits = format[14] | (format[15] << 8);
+            wav.floating = audioFormat == 3;
+            foundFormat = wav.channels > 0 && wav.sampleRate > 0;
+            if (!skipBytes(chunkSize - 16)) {
+                return false;
+            }
+        } else if (dataChunk) {
+            if (!foundFormat) {
+                error = "Deflated WAV is missing fmt";
+                return false;
+            }
+            wav.dataOffset = wav.cursor;
+            wav.pcmBytes = chunkSize;
+            wav.headerReady = true;
+            return true;
+        } else if (!skipBytes(chunkSize)) {
+            return false;
+        }
+        if (!dataChunk && (chunkSize & 1u) != 0 && !skipBytes(1)) {
+            return false;
+        }
+    }
+}
+
+AudioStore::ZipWav* AudioStore::zipWavFor(const FileRef& file, std::string& error) {
+#if !defined(__EMSCRIPTEN__)
+    (void)file;
+    (void)error;
+    return nullptr;
+#else
+    if (file.external || !isWavExtension(file.path)) {
+        return nullptr;
+    }
+    const int id = identify(file);
+    for (ZipWav& existing : zipWavs_) {
+        if (existing.fileId == id) {
+            return &existing;
         }
     }
     auto* zip = static_cast<mz_zip_archive*>(zip_);
-    std::vector<std::uint8_t> bytes;
+    if (zip == nullptr) {
+        return nullptr;
+    }
+    const int index = locateEntry(zip, file.path);
+    if (index < 0) {
+        return nullptr;
+    }
+    mz_zip_archive_file_stat stat;
+    if (!mz_zip_reader_file_stat(zip, static_cast<mz_uint>(index), &stat) || stat.m_method == 0) {
+        return nullptr;
+    }
+    ZipWav created;
+    created.entryIndex = index;
+    created.fileId = id;
+    if (!zipPrepare(created, error)) {
+        zipRestart(created);
+        if (created.iter != nullptr) {
+            mz_zip_reader_extract_iter_free(static_cast<mz_zip_reader_extract_iter_state*>(created.iter));
+            created.iter = nullptr;
+        }
+        return nullptr;
+    }
+    zipWavs_.push_back(std::move(created));
+    return &zipWavs_.back();
+#endif
+}
+
+AudioStore::Decoded* AudioStore::decodedFor(const FileRef& file, std::string& error) {
+    const int id = identify(file);
+    for (auto& entry : decoded_) {
+        if (entry.first == id) {
+            return &entry.second;
+        }
+    }
+    Decoded decoded;
+    const std::uint8_t* source = nullptr;
+    size_t sourceSize = 0;
+    auto releaseMap = [&decoded]() {
+#ifndef __EMSCRIPTEN__
+        if (decoded.sourceMap.data != nullptr && decoded.sourceMap.ownedMap) {
+            munmap(decoded.sourceMap.data, decoded.sourceMap.size);
+            decoded.sourceMap.data = nullptr;
+        }
+        if (decoded.sourceMap.fd >= 0) {
+            close(decoded.sourceMap.fd);
+            decoded.sourceMap.fd = -1;
+        }
+#else
+        (void)decoded;
+#endif
+    };
     if (file.external) {
 #ifndef __EMSCRIPTEN__
         std::string path = file.path;
-        if (!path.empty() && path[0] != '/') {
+        if (!(path.size() > 0 && path[0] == '/') && !(path.size() > 1 && path[1] == ':')) {
             path = parentDirectory(label_) + "/" + file.path;
         }
-        std::ifstream input(path, std::ios::binary);
-        if (!input) {
-            error = "Could not open " + path;
+        if (!mapFile(path, decoded.sourceMap, error)) {
             return nullptr;
         }
-        input.seekg(0, std::ios::end);
-        const auto length = input.tellg();
-        input.seekg(0);
-        bytes.resize(static_cast<size_t>(length));
-        input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        source = decoded.sourceMap.data;
+        sourceSize = decoded.sourceMap.size;
 #else
         error = "External media is ignored in the web build";
         return nullptr;
 #endif
     } else {
+        auto* zip = static_cast<mz_zip_archive*>(zip_);
         if (zip == nullptr) {
             return nullptr;
         }
@@ -465,29 +690,53 @@ AudioStore::Decoded* AudioStore::decodedFor(const FileRef& file, std::string& er
             error = "Missing media " + file.path;
             return nullptr;
         }
-        size_t heapSize = 0;
-        void* heap = mz_zip_reader_extract_to_heap(zip, static_cast<mz_uint>(index), &heapSize, 0);
-        if (heap == nullptr) {
-            error = "Could not read " + file.path;
+        mz_zip_archive_file_stat stat;
+        if (!mz_zip_reader_file_stat(zip, static_cast<mz_uint>(index), &stat)) {
+            error = "Could not stat " + file.path;
             return nullptr;
         }
-        bytes.assign(static_cast<std::uint8_t*>(heap), static_cast<std::uint8_t*>(heap) + heapSize);
-        mz_free(heap);
+        if (stat.m_method == 0 && archive_.data != nullptr) {
+            const std::uint8_t* local = archive_.data + stat.m_local_header_ofs;
+            if (stat.m_local_header_ofs + 30 > archive_.size) {
+                error = "Truncated zip local header";
+                return nullptr;
+            }
+            const std::uint16_t nameLength = static_cast<std::uint16_t>(local[26] | (local[27] << 8));
+            const std::uint16_t extraLength = static_cast<std::uint16_t>(local[28] | (local[29] << 8));
+            const size_t dataOffset = static_cast<size_t>(stat.m_local_header_ofs + 30 + nameLength + extraLength);
+            if (dataOffset + static_cast<size_t>(stat.m_comp_size) > archive_.size) {
+                error = "Truncated stored zip entry";
+                return nullptr;
+            }
+            source = archive_.data + dataOffset;
+            sourceSize = static_cast<size_t>(stat.m_comp_size);
+        } else {
+            size_t heapSize = 0;
+            void* heap = mz_zip_reader_extract_to_heap(zip, static_cast<mz_uint>(index), &heapSize, 0);
+            if (heap == nullptr) {
+                error = "Could not read " + file.path;
+                return nullptr;
+            }
+            decoded.compressed.assign(static_cast<std::uint8_t*>(heap), static_cast<std::uint8_t*>(heap) + heapSize);
+            mz_free(heap);
+            source = decoded.compressed.data();
+            sourceSize = decoded.compressed.size();
+        }
     }
     auto* decoder = new ma_decoder();
     const ma_decoder_config config = ma_decoder_config_init(ma_format_f32, 0, 0);
-    if (ma_decoder_init_memory(bytes.data(), bytes.size(), &config, decoder) != MA_SUCCESS) {
+    if (source == nullptr || ma_decoder_init_memory(source, sourceSize, &config, decoder) != MA_SUCCESS) {
         delete decoder;
+        releaseMap();
         error = "Could not decode " + file.path;
         return nullptr;
     }
-    Decoded decoded;
-    // The decoder keeps this pointer. Moving the vector transfers the same allocation.
-    decoded.compressed = std::move(bytes);
+    decoded.bytes = source;
+    decoded.byteCount = sourceSize;
     decoded.channels = static_cast<int>(decoder->outputChannels);
     decoded.sampleRate = static_cast<int>(decoder->outputSampleRate);
     decoded.decoder = decoder;
-    decoded_.emplace_back(key, std::move(decoded));
+    decoded_.emplace_back(id, std::move(decoded));
     return &decoded_.back().second;
 }
 
@@ -520,99 +769,128 @@ bool AudioStore::readWav(const WavView& wav, int outputRate, std::int64_t source
     return true;
 }
 
-bool AudioStore::readCached(const FileRef& file, Decoded& decoded, int outputRate, std::int64_t sourceFrame,
-                            float* interleaved, int frameCount, int channelCount, bool& cacheMiss) {
+bool AudioStore::fillBlock(Decoded* decoded, ZipWav* zipWav, Block& block, std::string& error) {
+    const int fileRate = std::max(decoded != nullptr ? decoded->sampleRate : zipWav->sampleRate, 1);
+    const int fileChannels = std::max(decoded != nullptr ? decoded->channels : zipWav->channels, 1);
+    const int storedChannels = std::max(block.channels, 1);
+    const double blockSecond = static_cast<double>(block.index * static_cast<std::int64_t>(kBlockFrames)) /
+                               static_cast<double>(std::max(block.rate, 1));
+    const auto fileFrame = static_cast<std::uint64_t>(std::max(0.0, blockSecond * fileRate));
+    const int fileCount = static_cast<int>(std::ceil(static_cast<double>(kBlockFrames) * fileRate /
+                                                     static_cast<double>(std::max(block.rate, 1)))) +
+                          4;
+    const size_t scratchFrames = static_cast<size_t>(fileCount) * static_cast<size_t>(fileChannels);
+    if (decodeScratch_.size() < scratchFrames) {
+        decodeScratch_.resize(scratchFrames);
+    }
+    std::fill_n(decodeScratch_.begin(), scratchFrames, 0.0f);
+    if (decoded != nullptr) {
+        auto* decoder = static_cast<ma_decoder*>(decoded->decoder);
+        ma_decoder_seek_to_pcm_frame(decoder, static_cast<ma_uint64>(fileFrame));
+        ma_uint64 framesRead = 0;
+        ma_decoder_read_pcm_frames(decoder, decodeScratch_.data(), static_cast<ma_uint64>(fileCount), &framesRead);
+        (void)framesRead;
+    } else {
+        const int bytesPerSample = std::max(zipWav->bits / 8, 1);
+        const int frameBytes = bytesPerSample * fileChannels;
+        const std::uint64_t pcmFrames = frameBytes > 0 ? zipWav->pcmBytes / static_cast<std::uint64_t>(frameBytes) : 0;
+        const size_t byteCount = static_cast<size_t>(fileCount) * static_cast<size_t>(frameBytes);
+        if (byteScratch_.size() < byteCount) {
+            byteScratch_.resize(byteCount);
+        }
+        std::fill(byteScratch_.begin(), byteScratch_.begin() + static_cast<std::ptrdiff_t>(byteCount), 0);
+        if (fileFrame < pcmFrames) {
+            const std::uint64_t offset = zipWav->dataOffset + fileFrame * static_cast<std::uint64_t>(frameBytes);
+            const size_t available = static_cast<size_t>(std::min<std::uint64_t>(
+                pcmFrames - fileFrame, static_cast<std::uint64_t>(fileCount)));
+            if (!zipRead(*zipWav, offset, byteScratch_.data(), available * static_cast<size_t>(frameBytes))) {
+                error = "Could not read deflated WAV";
+                return false;
+            }
+        }
+        for (int frame = 0; frame < fileCount; ++frame) {
+            for (int channel = 0; channel < fileChannels; ++channel) {
+                const std::uint8_t* sample = byteScratch_.data() + static_cast<size_t>(frame * frameBytes + channel * bytesPerSample);
+                decodeScratch_[static_cast<size_t>(frame) * static_cast<size_t>(fileChannels) + static_cast<size_t>(channel)] =
+                    pcmSample(sample, zipWav->bits, zipWav->floating);
+            }
+        }
+    }
+    for (size_t outFrame = 0; outFrame < kBlockFrames; ++outFrame) {
+        const double position = static_cast<double>(outFrame) * static_cast<double>(fileRate) /
+                                static_cast<double>(std::max(block.rate, 1));
+        const auto left = static_cast<size_t>(std::min<double>(position, std::max(0, fileCount - 1)));
+        const size_t right = std::min(left + 1, static_cast<size_t>(std::max(fileCount - 1, 0)));
+        const float fraction = static_cast<float>(position - static_cast<double>(left));
+        for (int channel = 0; channel < storedChannels; ++channel) {
+            const int sourceChannel = fileChannels == 1 ? 0 : std::min(channel, fileChannels - 1);
+            const float first = decodeScratch_[left * static_cast<size_t>(fileChannels) + static_cast<size_t>(sourceChannel)];
+            const float second = decodeScratch_[right * static_cast<size_t>(fileChannels) + static_cast<size_t>(sourceChannel)];
+            const float mixed = first + (second - first) * fraction;
+            const int quantized = static_cast<int>(std::lrintf(std::clamp(mixed, -1.0f, 1.0f) * 32767.0f));
+            block.pcm[outFrame * static_cast<size_t>(storedChannels) + static_cast<size_t>(channel)] =
+                static_cast<std::int16_t>(quantized);
+        }
+    }
+    return true;
+}
+
+bool AudioStore::readCached(int fileId, Decoded* decoded, ZipWav* zipWav, int outputRate, std::int64_t sourceFrame,
+                            float* interleaved, int frameCount, int channelCount, bool& cacheMiss, std::string& error) {
     cacheMiss = false;
-    const int storedChannels = std::clamp(decoded.channels, 1, 2);
-    const std::string key = fileKey(file);
+    const int fileChannels = decoded != nullptr ? decoded->channels : zipWav->channels;
+    const int storedChannels = std::clamp(fileChannels, 1, 2);
+    if (sourceFrame < 0) {
+        sourceFrame = 0;
+    }
     const std::int64_t firstBlock = sourceFrame / static_cast<std::int64_t>(kBlockFrames);
     const std::int64_t lastBlock = (sourceFrame + frameCount - 1) / static_cast<std::int64_t>(kBlockFrames);
+    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
     for (Block& block : blocks_) {
-        if (block.key == key && block.rate == outputRate) {
-            const double distance = std::abs(static_cast<double>(block.index - firstBlock));
-            block.anchor = distance;
-            block.pinned = block.index >= firstBlock && block.index <= lastBlock;
+        if (!block.occupied || block.fileId != fileId || block.rate != outputRate) {
+            continue;
+        }
+        block.anchor = std::abs(static_cast<double>(block.index - firstBlock));
+        if (block.index >= firstBlock && block.index <= lastBlock) {
+            block.touchedAt = now;
         }
     }
     for (std::int64_t blockIndex = firstBlock; blockIndex <= lastBlock; ++blockIndex) {
-        const auto found = std::find_if(blocks_.begin(), blocks_.end(), [&](const Block& block) {
-            return block.key == key && block.rate == outputRate && block.index == blockIndex && block.channels == storedChannels;
-        });
-        if (found != blocks_.end()) {
-            found->pinned = true;
+        if (findBlock(fileId, outputRate, blockIndex) != nullptr) {
             continue;
         }
-        Block block;
-        block.key = key;
-        block.index = blockIndex;
-        block.rate = outputRate;
-        block.channels = storedChannels;
-        block.pinned = true;
-        block.anchor = 0;
-        block.pcm.assign(kBlockFrames * static_cast<size_t>(storedChannels), 0);
-        const size_t incoming = block.pcm.size() * sizeof(std::int16_t);
-        evict(incoming);
-        if (used_ + incoming > budget_) {
+        const size_t incoming = kBlockFrames * static_cast<size_t>(storedChannels) * sizeof(std::int16_t);
+        Block* block = claimBlock(fileId, blockIndex, outputRate, storedChannels, incoming);
+        if (block == nullptr) {
             cacheMiss = true;
-            for (Block& existing : blocks_) {
-                existing.pinned = false;
-            }
             return false;
         }
-        auto* decoder = static_cast<ma_decoder*>(decoded.decoder);
-        const double blockSecond = static_cast<double>(blockIndex * static_cast<std::int64_t>(kBlockFrames)) /
-                                   static_cast<double>(outputRate);
-        const auto fileFrame = static_cast<ma_uint64>(std::max(0.0, blockSecond * decoded.sampleRate));
-        const int fileCount = static_cast<int>(std::ceil(static_cast<double>(kBlockFrames) * decoded.sampleRate /
-                                                         static_cast<double>(outputRate))) +
-                              4;
-        std::vector<float> filePcm(static_cast<size_t>(fileCount) * static_cast<size_t>(decoded.channels), 0.0f);
-        ma_decoder_seek_to_pcm_frame(decoder, fileFrame);
-        ma_uint64 framesRead = 0;
-        ma_decoder_read_pcm_frames(decoder, filePcm.data(), static_cast<ma_uint64>(fileCount), &framesRead);
-        for (size_t outFrame = 0; outFrame < kBlockFrames; ++outFrame) {
-            const double position = static_cast<double>(outFrame) * static_cast<double>(decoded.sampleRate) /
-                                    static_cast<double>(outputRate);
-            const auto left = static_cast<size_t>(std::min<double>(position, std::max(0, fileCount - 1)));
-            const size_t right = std::min(left + 1, static_cast<size_t>(std::max(fileCount - 1, 0)));
-            const float fraction = static_cast<float>(position - static_cast<double>(left));
-            for (int channel = 0; channel < storedChannels; ++channel) {
-                const int sourceChannel = decoded.channels == 1 ? 0 : std::min(channel, decoded.channels - 1);
-                const float first = filePcm[left * static_cast<size_t>(decoded.channels) + static_cast<size_t>(sourceChannel)];
-                const float second = filePcm[right * static_cast<size_t>(decoded.channels) + static_cast<size_t>(sourceChannel)];
-                const float mixed = first + (second - first) * fraction;
-                const int quantized = static_cast<int>(std::lrintf(std::clamp(mixed, -1.0f, 1.0f) * 32767.0f));
-                block.pcm[outFrame * static_cast<size_t>(storedChannels) + static_cast<size_t>(channel)] =
-                    static_cast<std::int16_t>(quantized);
-            }
+        if (!fillBlock(decoded, zipWav, *block, error)) {
+            releaseBlock(*block);
+            cacheMiss = true;
+            return false;
         }
-        used_ += incoming;
-        blocks_.push_back(std::move(block));
     }
+    const Block* current = nullptr;
+    std::int64_t currentIndex = -1;
     for (int frameIndex = 0; frameIndex < frameCount; ++frameIndex) {
         const std::int64_t absolute = sourceFrame + frameIndex;
         const std::int64_t blockIndex = absolute / static_cast<std::int64_t>(kBlockFrames);
         const size_t offset = static_cast<size_t>(absolute % static_cast<std::int64_t>(kBlockFrames));
-        const Block* block = nullptr;
-        for (const Block& candidate : blocks_) {
-            if (candidate.key == key && candidate.rate == outputRate && candidate.index == blockIndex) {
-                block = &candidate;
-                break;
-            }
+        if (blockIndex != currentIndex) {
+            current = findBlock(fileId, outputRate, blockIndex);
+            currentIndex = blockIndex;
         }
         for (int channel = 0; channel < channelCount; ++channel) {
             float sample = 0;
-            if (block != nullptr) {
+            if (current != nullptr) {
                 const int sourceChannel = storedChannels == 1 ? 0 : std::min(channel, storedChannels - 1);
-                sample = static_cast<float>(block->pcm[offset * static_cast<size_t>(storedChannels) +
-                                                       static_cast<size_t>(sourceChannel)]) /
+                sample = static_cast<float>(current->pcm[offset * static_cast<size_t>(storedChannels) +
+                                                         static_cast<size_t>(sourceChannel)]) /
                          32767.0f;
             }
             interleaved[frameIndex * channelCount + channel] = sample;
         }
-    }
-    for (Block& block : blocks_) {
-        block.pinned = false;
     }
     return true;
 }
@@ -628,8 +906,14 @@ bool AudioStore::readFrames(const FileRef& file, int outputRate, std::int64_t so
     if (WavView* wav = wavFor(file, error)) {
         return readWav(*wav, outputRate, sourceFrame, interleaved, frameCount, channelCount);
     }
+    const int id = identify(file);
+    if (ZipWav* zipWav = zipWavFor(file, error)) {
+        return readCached(id, nullptr, zipWav, outputRate, sourceFrame, interleaved, frameCount, channelCount, cacheMiss,
+                          error);
+    }
     if (Decoded* decoded = decodedFor(file, error)) {
-        return readCached(file, *decoded, outputRate, sourceFrame, interleaved, frameCount, channelCount, cacheMiss);
+        return readCached(id, decoded, nullptr, outputRate, sourceFrame, interleaved, frameCount, channelCount, cacheMiss,
+                          error);
     }
     writeSilence(interleaved, frameCount, channelCount);
     return true;

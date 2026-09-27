@@ -17,6 +17,8 @@ struct FileRef {
     int sampleRate = 48000;
     double duration = 0;
     std::string algorithm;
+    // Index into AudioStore's path table. Set on first read; -1 until then.
+    mutable int storeId = -1;
 };
 
 // One placement step from an outer timeline into the clip's content clock.

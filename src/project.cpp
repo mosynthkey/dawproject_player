@@ -45,6 +45,7 @@ double gainFromUnit(double value, const std::string& unit) {
     if (unit == "decibel") {
         return linearToDecibelGain(value);
     }
+    // `normalized` has no defined fader law in the format, so it is a linear gain.
     return value;
 }
 
@@ -431,8 +432,8 @@ void readTracks(const XmlNode& track, Project& project, std::unordered_map<std::
         channel.mute.fallback = 0;
         if (const XmlNode* volume = channelNode->child("Volume")) {
             const std::string unit = volume->attribute("unit");
-            channel.volume.fallback = unit == "decibel" ? gainFromUnit(volume->number("value", 0), unit)
-                                                        : volume->number("value", 1);
+            const double raw = volume->number("value", unit == "decibel" ? 0.0 : 1.0);
+            channel.volume.fallback = gainFromUnit(raw, unit);
             if (!volume->attribute("id").empty()) {
                 parameters[volume->attribute("id")] = ParameterBinding{static_cast<int>(project.channels.size()),
                                                                        ParameterBinding::Kind::Volume, unit};
@@ -466,7 +467,6 @@ void readTracks(const XmlNode& track, Project& project, std::unordered_map<std::
 
 void readLanePoints(const XmlNode& node, TimeUnit unit, Project& project,
                     const std::unordered_map<std::string, ParameterBinding>& parameters) {
-    (void)unit;
     for (const XmlNode& child : node.children) {
         if (child.name == "Points") {
             std::string parameterId;
@@ -492,6 +492,7 @@ void readLanePoints(const XmlNode& node, TimeUnit unit, Project& project,
             } else if (unitName != "decibel") {
                 convert = [](double value, const std::string&) { return value; };
             }
+            curve->timeUnit = unit;
             readRealPoints(child, *curve, convert, unitName);
         }
         if (child.name == "Lanes" || child.name == "Clips") {
@@ -638,7 +639,8 @@ bool AudioEvent::sourceAt(const TempoMap& tempo, double arrangementSecond, doubl
         if (layer.parentUnit != cursorUnit) {
             parentTime = convertInto(tempo, cursor, cursorUnit, layer.parentUnit, cursor);
         }
-        if (parentTime < layer.origin || parentTime >= layer.origin + layer.duration) {
+        // The end point belongs to the clip. Callers sample it when a block lands on the boundary.
+        if (parentTime < layer.origin || parentTime > layer.origin + layer.duration) {
             return false;
         }
         double local = parentTime - layer.scheduleOrigin;

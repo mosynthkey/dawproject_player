@@ -70,15 +70,23 @@ public:
 private:
     struct Ring;
     struct Voice;
+    struct StretchPool;
 
     void fillLoop();
     void fillAhead();
     void mixBlock(float* deviceOut, int frameCount, bool advance);
     void requestSeek(std::int64_t frame);
+    void applyPendingSeek();
     void ensureVoices();
+    void discardVoices();
+    void buildSoloMask();
     void prepareMixBuffers();
     int channelCountFor(const AudioEvent& event) const;
     bool eventNeedsStretch(const AudioEvent& event, double ratio, double transpose) const;
+    double transposeAt(const AudioEvent& event, double arrangementSecond) const;
+    int acquireStretch(int channels);
+    void releaseStretch(Voice& voice);
+    void configureStretch(Voice& voice);
 
     std::shared_ptr<AudioStore> store_;
     Project project_;
@@ -92,19 +100,26 @@ private:
 
     std::atomic<bool> playing_{false};
     std::atomic<std::int64_t> playhead_{0};
+    std::atomic<std::int64_t> seekFrame_{0};
     std::atomic<std::uint64_t> seekId_{0};
     std::atomic<std::uint64_t> appliedSeek_{0};
+    std::atomic<std::uint64_t> audioSeekAck_{0};
     std::atomic<std::uint64_t> underruns_{0};
     std::atomic<std::uint64_t> callbackNs_{0};
     std::atomic<std::uint64_t> callbackFrames_{1};
     std::atomic<int> presetEpoch_{0};
 
+    std::unique_ptr<StretchPool> stretchPool_;
     std::vector<std::unique_ptr<Voice>> voices_;
+    std::vector<std::uint8_t> soloPlay_;
+    std::vector<std::uint8_t> voiceKeep_;
     std::vector<float> scratch_;
     std::vector<float> buses_;
     std::vector<float> post_;
     std::vector<float> popped_;
     std::vector<float> discard_;
+    std::vector<double> beatClock_;
+    std::vector<double> secondClock_;
     int scratchFrames_ = 256;
     // Voices are published only after the vector slot is fully constructed.
     // The audio thread never grows this vector.
