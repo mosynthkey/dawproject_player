@@ -343,6 +343,7 @@ Engine::Engine(std::shared_ptr<AudioStore> store, Project project, EngineSetting
     }
     cpuLastWallNs_ = static_cast<std::uint64_t>(timeSeconds() * 1.0e9);
     cpuLastProcessNs_ = processCpuNs();
+    refreshArrangementEnd();
 }
 
 Engine::~Engine() {
@@ -382,12 +383,65 @@ void Engine::seekBar(double bar) {
     seekSeconds(project_.tempo.secondsAtBeat(beats));
 }
 
-double Engine::positionSeconds() const {
+std::int64_t Engine::positionFrame() const {
     const std::uint64_t seek = seekId_.load(std::memory_order_acquire);
     if (appliedSeek_.load(std::memory_order_acquire) != seek) {
-        return static_cast<double>(seekFrame_.load(std::memory_order_relaxed)) / static_cast<double>(outputRate_);
+        return seekFrame_.load(std::memory_order_relaxed);
     }
-    return static_cast<double>(playhead_.load(std::memory_order_relaxed)) / static_cast<double>(outputRate_);
+    return playhead_.load(std::memory_order_relaxed);
+}
+
+void Engine::refreshArrangementEnd() {
+    const double length = project_.lengthSeconds();
+    if (!(length > 0.0) || outputRate_ <= 0) {
+        arrangementEndFrame_ = -1;
+        return;
+    }
+    arrangementEndFrame_ = static_cast<std::int64_t>(std::llround(length * static_cast<double>(outputRate_)));
+}
+
+bool Engine::atArrangementEnd() const {
+    return arrangementEndFrame_ >= 0 && positionFrame() >= arrangementEndFrame_;
+}
+
+double Engine::positionSeconds() const {
+    return static_cast<double>(positionFrame()) / static_cast<double>(outputRate_);
+}
+
+void Engine::warmOpening(double seconds) {
+    if (seconds <= 0.0 || deviceOpen_ || fillThread_.joinable()) {
+        return;
+    }
+    const double window = std::min(seconds, std::max(project_.lengthSeconds(), 0.0));
+    std::vector<float> decoded;
+    for (const AudioEvent& event : project_.events) {
+        if (event.endSecond <= 0.0 || event.startSecond >= window) {
+            continue;
+        }
+        const int channels = std::max(channelCountFor(event), 1);
+        double cursor = std::max(event.startSecond, 0.0);
+        while (cursor < window && cursor < event.endSecond) {
+            const double next = std::min(event.endSecond, std::min(window, cursor + 0.25));
+            double sourceStart = 0;
+            double sourceEnd = 0;
+            const bool haveStart = event.sourceAt(project_.tempo, cursor, sourceStart);
+            const bool haveEnd = next > cursor && event.sourceAt(project_.tempo, next, sourceEnd);
+            cursor = next;
+            if (!haveStart || !haveEnd || sourceEnd <= sourceStart) {
+                continue;
+            }
+            const auto first = static_cast<std::int64_t>(std::llround(std::max(0.0, sourceStart) * outputRate_));
+            const auto count64 = std::llround((sourceEnd - sourceStart) * static_cast<double>(outputRate_));
+            const int count = static_cast<int>(std::clamp<std::int64_t>(count64, 1, static_cast<std::int64_t>(outputRate_) * 2));
+            decoded.resize(static_cast<size_t>(count) * static_cast<size_t>(channels));
+            bool cacheMiss = false;
+            store_->readFrames(event.file, outputRate_, first, decoded.data(), count, channels, cacheMiss);
+        }
+    }
+    inlineFill_ = true;
+    ensureVoices();
+    fillAhead();
+    inlineFill_ = false;
 }
 
 double Engine::positionBeats() const { return project_.tempo.beatsAtSeconds(positionSeconds()); }
@@ -987,8 +1041,18 @@ void Engine::mixBlock(float* deviceOut, int frameCount, bool advance) {
         }
     }
     if (advance && playing_.load() && seekId_.load(std::memory_order_acquire) == appliedSeek_.load(std::memory_order_acquire)) {
-        std::int64_t expected = origin;
-        playhead_.compare_exchange_strong(expected, origin + frames, std::memory_order_relaxed);
+        const std::int64_t endFrame = arrangementEndFrame_;
+        // Leave the playhead on the last clip. The transport stops instead of rolling into silence.
+        if (endFrame >= 0 && origin >= endFrame) {
+            playing_.store(false);
+            playhead_.store(endFrame);
+        } else if (endFrame >= 0 && origin + static_cast<std::int64_t>(frames) >= endFrame) {
+            playhead_.store(endFrame);
+            playing_.store(false);
+        } else {
+            std::int64_t expected = origin;
+            playhead_.compare_exchange_strong(expected, origin + frames, std::memory_order_relaxed);
+        }
     }
 }
 
@@ -1052,11 +1116,21 @@ bool Engine::startDevice(std::string& error) {
         error = "Could not open the playback device";
         return false;
     }
+    const int warmedRate = outputRate_;
+    const bool primed = !voices_.empty();
     outputRate_ = static_cast<int>(device->sampleRate);
     deviceChannels_ = static_cast<int>(device->playback.channels);
     prepareMixBuffers();
-    discardVoices();
+    refreshArrangementEnd();
+    // warmOpening primed stretchers in output-rate frames. A different device rate cannot reuse them.
+    if (!primed || outputRate_ != warmedRate) {
+        discardVoices();
+    }
+    if (resume) {
+        playing_.store(true);
+    }
     if (ma_device_start(device) != MA_SUCCESS) {
+        playing_.store(false);
         ma_device_uninit(device);
         delete device;
         error = "Could not start the playback device";
@@ -1097,6 +1171,7 @@ bool Engine::renderToWav(const RenderRequest& request, std::string& error) {
         return false;
     }
     outputRate_ = std::max(request.sampleRate, 8000);
+    refreshArrangementEnd();
     int channels = 2;
     if (request.multichannel) {
         channels = 2;

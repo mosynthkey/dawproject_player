@@ -176,7 +176,11 @@ Native: a dependency-free ANSI screen, not ncurses.
 - Track and bus names with mute, solo, and hardware output assignment.
 - The stretch preset.
 
-Keys: play/pause, stop, seek by a bar, jump to a bar, jump to a time in seconds, change a channel's hardware output, change the stretch preset, start render, quit.
+Keys: play/pause, stop, next song, previous song, seek by a bar, jump to a bar, jump to a time in seconds, change a channel's hardware output, change the stretch preset, start render, quit.
+
+Native playback accepts more than one `.dawproject`. They play one at a time, in argument order, and the transport does not start the next song by itself. Reaching the last clip stops playback and leaves the playhead there. Play at that point restarts the current song from the beginning. On the last song, play starts the playlist from the first file. Next and previous start that song from the beginning. At the ends of the list those keys do nothing.
+
+When fewer than five seconds remain, or a shorter song is already playing, the player loads the following file and prepares its first two seconds: source reads into the cache, and stretcher prime at the start. Only that next song is prepared. Skipping earlier loads on the spot and waits if that prepare is already running. Stretch preset, cache budget, and the selected device carry over. Mute, solo, and hardware assignments return to the file being started. The device may reopen between songs. A file that fails to open is not played, and the reason is shown. A render of the current song blocks a song change until it finishes. The web build and `render` stay on one file.
 
 WASM: the engine is a C API. The page is a small HTML shell with the same commands, the same meters, device output picks, and the stretch preset. The page must be served with the COOP and COEP headers above.
 

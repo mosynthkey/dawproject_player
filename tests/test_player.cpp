@@ -351,6 +351,42 @@ void testCache(const std::filesystem::path& directory) {
     CHECK(loaded.store->bytesInUse() >= used);
 }
 
+void testArrangementEnd(const std::filesystem::path& directory) {
+    dawplay::LoadResult loaded = dawplay::loadProjectFile((directory / "ratio.dawproject").string());
+    CHECK(loaded.error.empty());
+    const double length = loaded.project.lengthSeconds();
+    dawplay::EngineSettings settings;
+    settings.outputRate = 48000;
+    dawplay::Engine engine(loaded.store, loaded.project, settings);
+    engine.warmOpening(2.0);
+    CHECK(!engine.playing());
+    CHECK(engine.positionSeconds() < 1.0e-4);
+    CHECK(!engine.atArrangementEnd());
+
+    engine.play();
+    std::vector<float> buffer(static_cast<size_t>(256 * 2));
+    for (int step = 0; step < 10; ++step) {
+        engine.pump(buffer.data(), 256);
+    }
+    engine.pause();
+    CHECK(!engine.atArrangementEnd());
+    CHECK(engine.positionSeconds() < length);
+
+    engine.play();
+    for (int step = 0; step < 400 && engine.playing(); ++step) {
+        engine.pump(buffer.data(), 256);
+    }
+    CHECK(!engine.playing());
+    CHECK(engine.atArrangementEnd());
+    CHECK(std::abs(engine.positionSeconds() - length) < 1.0e-3);
+    const double endedAt = engine.positionSeconds();
+    for (int step = 0; step < 20; ++step) {
+        engine.pump(buffer.data(), 256);
+    }
+    CHECK(!engine.playing());
+    CHECK(std::abs(engine.positionSeconds() - endedAt) < 1.0e-6);
+}
+
 void testStretcherCap(const std::filesystem::path& directory, const std::vector<std::uint8_t>& sine) {
     std::string clips;
     for (int clipIndex = 0; clipIndex < 20; ++clipIndex) {
@@ -394,6 +430,7 @@ int main() {
     testTempo();
     const std::vector<std::uint8_t> sine = makeSineWav(48000, 1.0, 440.0, 0.5);
     testRender(directory, sine);
+    testArrangementEnd(directory);
     testExternalAndMissing(directory, sine);
     testCache(directory);
     std::printf("stretch and pool checks\n");

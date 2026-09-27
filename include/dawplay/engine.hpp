@@ -45,9 +45,12 @@ public:
     void seekSeconds(double seconds);
     void seekBar(double bar);
     bool playing() const { return playing_.load(); }
+    bool atArrangementEnd() const;
     double positionSeconds() const;
     double positionBeats() const;
     double positionBar() const;
+    // Read the opening into the source cache and prime stretchers. The device stays closed.
+    void warmOpening(double seconds);
 
     void setStretchPreset(StretchPreset preset);
     void setHardwareOutput(int channelIndex, int startChannel, int width);
@@ -77,6 +80,8 @@ private:
     void mixBlock(float* deviceOut, int frameCount, bool advance);
     void requestSeek(std::int64_t frame);
     void applyPendingSeek();
+    void refreshArrangementEnd();
+    std::int64_t positionFrame() const;
     void ensureVoices();
     void discardVoices();
     void buildSoloMask();
@@ -100,6 +105,7 @@ private:
 
     std::atomic<bool> playing_{false};
     std::atomic<std::int64_t> playhead_{0};
+    std::int64_t arrangementEndFrame_ = -1;
     std::atomic<std::int64_t> seekFrame_{0};
     std::atomic<std::uint64_t> seekId_{0};
     std::atomic<std::uint64_t> appliedSeek_{0};
