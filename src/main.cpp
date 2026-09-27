@@ -2,11 +2,13 @@
 
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -22,14 +24,26 @@ void printUsage() {
         "  dawplay <file.dawproject> [more.dawproject ...]\n"
         "  dawplay info <file.dawproject>\n"
         "  dawplay devices\n"
-        "  dawplay play <file.dawproject> [--device N]\n"
+        "  dawplay play <file.dawproject> [--device N] [--seek SEC]\n"
         "  dawplay render <file.dawproject> <out.wav> [--rate 48000] [--format f32] [--layout stereo]\n"
         "\n"
         "Formats: f32 s32 s24 s16 u8. Layout: stereo or multi.\n"
         "Keys: space play/pause, s stop, n next, b previous, left/right bar, g bar, t seconds,\n"
         "      up/down track, o hardware output, p preset, d device,\n"
-        "      [ ] cache budget, f format, l layout, r render, q quit.\n",
+        "      [ ] cache budget, f format, l layout, r render, q quit.\n"
+        "play reads stdin lines: seek SEC, volume INDEX LINEAR, mute INDEX 0|1, solo INDEX 0|1.\n"
+        "It prints pos SEC until the arrangement ends or stdin closes.\n",
         stderr);
+}
+
+std::string singleLine(const std::string& text, const char* fallback) {
+    std::string line = text.empty() ? fallback : text;
+    for (char& character : line) {
+        if (character == '\t' || character == '\n' || character == '\r') {
+            character = ' ';
+        }
+    }
+    return line;
 }
 
 void printInfo(const dawplay::LoadResult& loaded) {
@@ -41,10 +55,14 @@ void printInfo(const dawplay::LoadResult& loaded) {
     std::printf("Channels: %zu\n", project.channels.size());
     for (size_t channelIndex = 0; channelIndex < project.channels.size(); ++channelIndex) {
         const dawplay::MixerChannel& channel = project.channels[channelIndex];
-        std::printf("  [%zu] %s role=%s solo=%s hw=%d/%d\n", channelIndex,
-                    channel.name.empty() ? "(unnamed)" : channel.name.c_str(),
-                    channel.role.empty() ? "regular" : channel.role.c_str(), channel.solo ? "yes" : "no",
+        std::printf("  [%zu] %s role=%s solo=%s mute=%s vol=%.6f hw=%d/%d\n", channelIndex,
+                    singleLine(channel.name, "(unnamed)").c_str(), channel.role.empty() ? "regular" : channel.role.c_str(),
+                    channel.solo ? "yes" : "no", channel.mute.fallback >= 0.5 ? "yes" : "no", channel.volume.fallback,
                     channel.hardwareStart, channel.hardwareWidth);
+    }
+    for (const dawplay::AudioEvent& event : project.events) {
+        std::printf("clip\t%d\t%.6f\t%.6f\t%s\n", event.channelIndex, event.startSecond, event.endSecond,
+                    singleLine(event.name, "clip").c_str());
     }
     for (const std::string& warning : project.warnings) {
         std::printf("Warning: %s\n", warning.c_str());
@@ -584,8 +602,49 @@ int printDevices() {
     return 0;
 }
 
+void applyControl(dawplay::Engine& engine, const std::string& line) {
+    std::istringstream input(line);
+    std::string verb;
+    if (!(input >> verb)) {
+        return;
+    }
+    if (verb == "seek") {
+        double seconds = 0;
+        if (!(input >> seconds)) {
+            return;
+        }
+        const double length = engine.project().lengthSeconds();
+        if (length > 0.0 && seconds > length) {
+            seconds = length;
+        }
+        engine.seekSeconds(seconds);
+        return;
+    }
+    int channelIndex = 0;
+    if (!(input >> channelIndex)) {
+        return;
+    }
+    if (verb == "volume") {
+        double linear = 1;
+        if (input >> linear) {
+            engine.setChannelLevel(channelIndex, static_cast<float>(linear));
+        }
+        return;
+    }
+    int enabled = 0;
+    if (!(input >> enabled)) {
+        return;
+    }
+    if (verb == "mute") {
+        engine.setChannelMute(channelIndex, enabled != 0);
+    } else if (verb == "solo") {
+        engine.setChannelSolo(channelIndex, enabled != 0);
+    }
+}
+
 // Plays until the arrangement ends or stdin closes. The GUI stops playback by closing the pipe.
-int runHeadless(const std::string& path, int deviceIndex) {
+// Stdin lines seek and change mixer controls. Stdout prints the playhead.
+int runHeadless(const std::string& path, int deviceIndex, double startSeconds) {
     dawplay::LoadResult loaded = dawplay::loadProjectFile(path);
     if (!loaded.error.empty()) {
         std::fprintf(stderr, "%s\n", loaded.error.c_str());
@@ -601,26 +660,55 @@ int runHeadless(const std::string& path, int deviceIndex) {
         std::fprintf(stderr, "%s\n", error.c_str());
         return 1;
     }
+    if (startSeconds > 0.0) {
+        const double length = engine.project().lengthSeconds();
+        if (length > 0.0 && startSeconds > length) {
+            startSeconds = length;
+        }
+        engine.seekSeconds(startSeconds);
+    }
     engine.play();
     std::fputs("playing\n", stdout);
     std::fflush(stdout);
+    std::string pending;
     while (engine.playing() || !engine.atArrangementEnd()) {
         pollfd input{};
         input.fd = STDIN_FILENO;
         input.events = POLLIN;
         const int ready = poll(&input, 1, 200);
         if (ready > 0) {
-            char byte = 0;
-            if (read(STDIN_FILENO, &byte, 1) <= 0) {
+            char buffer[256];
+            const ssize_t count = read(STDIN_FILENO, buffer, sizeof(buffer));
+            if (count <= 0) {
                 break;
             }
-        } else if (ready < 0) {
+            pending.append(buffer, buffer + count);
+            if (pending.size() > 8192) {
+                pending.clear();
+            }
+            for (;;) {
+                const auto newline = pending.find('\n');
+                if (newline == std::string::npos) {
+                    break;
+                }
+                std::string line = pending.substr(0, newline);
+                pending.erase(0, newline + 1);
+                if (!line.empty() && line.back() == '\r') {
+                    line.pop_back();
+                }
+                applyControl(engine, line);
+            }
+        } else if (ready < 0 && errno != EINTR) {
             break;
         }
+        std::printf("pos %.3f\n", engine.positionSeconds());
+        std::fflush(stdout);
         if (!engine.playing() && engine.atArrangementEnd()) {
             break;
         }
     }
+    std::printf("pos %.3f\n", engine.positionSeconds());
+    std::fflush(stdout);
     engine.pause();
     engine.stopDevice();
     return 0;
@@ -642,16 +730,19 @@ int main(int argc, char** argv) {
         }
         const std::string path = argv[2];
         int deviceIndex = -1;
+        double startSeconds = 0;
         for (int index = 3; index < argc; ++index) {
             const std::string flag = argv[index];
             if (flag == "--device" && index + 1 < argc) {
                 deviceIndex = std::stoi(argv[++index]);
+            } else if (flag == "--seek" && index + 1 < argc) {
+                startSeconds = std::stod(argv[++index]);
             } else {
                 printUsage();
                 return 1;
             }
         }
-        return runHeadless(path, deviceIndex);
+        return runHeadless(path, deviceIndex, startSeconds);
     }
     std::string path;
     std::string output;

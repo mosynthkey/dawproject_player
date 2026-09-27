@@ -1,4 +1,6 @@
 build/
+build-web/
 *.wav
 *.dawproject
 /tmp/
+.DS_Store

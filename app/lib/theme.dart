@@ -11,6 +11,9 @@ abstract final class DawColors {
   static const textBody = Color(0xB3FFFFFF);
   static const textLow = Color(0x66FFFFFF);
   static const warning = Color(0xFFF5A830);
+  static const mute = Color(0xFFFF6B7A);
+  static const solo = Color(0xFFF5C15A);
+  static const laneAlt = Color(0xFF1B1E26);
 }
 
 abstract final class DawTheme {

@@ -54,6 +54,10 @@ public:
 
     void setStretchPreset(StretchPreset preset);
     void setHardwareOutput(int channelIndex, int startChannel, int width);
+    // Replaces the file's volume curve for this channel until the engine is rebuilt.
+    void setChannelLevel(int channelIndex, float linearGain);
+    void setChannelMute(int channelIndex, bool muted);
+    void setChannelSolo(int channelIndex, bool solo);
     bool renderToWav(const RenderRequest& request, std::string& error);
 
     bool startDevice(std::string& error);
@@ -85,6 +89,7 @@ private:
     void ensureVoices();
     void discardVoices();
     void buildSoloMask();
+    bool soloEnabled(int channelIndex) const;
     void prepareMixBuffers();
     int channelCountFor(const AudioEvent& event) const;
     bool eventNeedsStretch(const AudioEvent& event, double ratio, double transpose) const;
@@ -118,6 +123,13 @@ private:
     std::unique_ptr<StretchPool> stretchPool_;
     std::vector<std::unique_ptr<Voice>> voices_;
     std::vector<std::uint8_t> soloPlay_;
+    // 0 follows the file, 1 forces the control on, 2 forces it off.
+    std::vector<std::atomic<int>> levelHeld_;
+    std::vector<std::atomic<float>> levelLinear_;
+    std::vector<std::atomic<int>> muteHeld_;
+    std::vector<std::atomic<int>> soloHeld_;
+    std::atomic<int> soloEpoch_{0};
+    int appliedSoloEpoch_ = -1;
     std::vector<std::uint8_t> voiceKeep_;
     std::vector<float> scratch_;
     std::vector<float> buses_;

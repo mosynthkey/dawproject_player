@@ -1,6 +1,6 @@
 # dawplay_app
 
-macOS Flutter shell for `dawplay`. The left pane keeps a list of `.dawproject` files and the output device. The right pane shows `dawplay info` for the selected file. Play runs `dawplay play` and sends that mix to the chosen device.
+macOS Flutter shell for `dawplay`. The left pane keeps a list of `.dawproject` files and the output device. The right pane is the arrangement: clips, a seekable playhead, and per-channel volume, solo, and mute. Play runs `dawplay play` and sends that mix to the chosen device.
 
 ```sh
 cmake -S .. -B ../build -DCMAKE_BUILD_TYPE=Release

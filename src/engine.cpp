@@ -319,7 +319,14 @@ Engine::Engine(std::shared_ptr<AudioStore> store, Project project, EngineSetting
       presetCode_(static_cast<int>(settings.preset)),
       hardwareStart_(project_.channels.size()),
       hardwareWidth_(project_.channels.size()),
-      stretchPool_(std::make_unique<StretchPool>()) {
+      stretchPool_(std::make_unique<StretchPool>()),
+      levelHeld_(project_.channels.size()),
+      levelLinear_(project_.channels.size()),
+      muteHeld_(project_.channels.size()),
+      soloHeld_(project_.channels.size()) {
+    for (size_t channelIndex = 0; channelIndex < levelLinear_.size(); ++channelIndex) {
+        levelLinear_[channelIndex].store(1.0f, std::memory_order_relaxed);
+    }
     mixOrder_ = mixOrder(project_);
     buildSoloMask();
     voices_.reserve(64);
@@ -500,6 +507,30 @@ void Engine::setHardwareOutput(int channelIndex, int startChannel, int width) {
     }
 }
 
+void Engine::setChannelLevel(int channelIndex, float linearGain) {
+    if (channelIndex < 0 || channelIndex >= static_cast<int>(levelHeld_.size())) {
+        return;
+    }
+    const float clamped = std::clamp(linearGain, 0.0f, 4.0f);
+    levelLinear_[static_cast<size_t>(channelIndex)].store(clamped, std::memory_order_relaxed);
+    levelHeld_[static_cast<size_t>(channelIndex)].store(1, std::memory_order_relaxed);
+}
+
+void Engine::setChannelMute(int channelIndex, bool muted) {
+    if (channelIndex < 0 || channelIndex >= static_cast<int>(muteHeld_.size())) {
+        return;
+    }
+    muteHeld_[static_cast<size_t>(channelIndex)].store(muted ? 1 : 2, std::memory_order_relaxed);
+}
+
+void Engine::setChannelSolo(int channelIndex, bool solo) {
+    if (channelIndex < 0 || channelIndex >= static_cast<int>(soloHeld_.size())) {
+        return;
+    }
+    soloHeld_[static_cast<size_t>(channelIndex)].store(solo ? 1 : 2, std::memory_order_relaxed);
+    soloEpoch_.fetch_add(1, std::memory_order_release);
+}
+
 void Engine::requestSeek(std::int64_t frame) {
     seekFrame_.store(std::max<std::int64_t>(frame, 0), std::memory_order_relaxed);
     seekId_.fetch_add(1, std::memory_order_release);
@@ -528,15 +559,42 @@ void Engine::applyPendingSeek() {
     appliedSeek_.store(seek, std::memory_order_release);
 }
 
+bool Engine::soloEnabled(int channelIndex) const {
+    if (channelIndex < 0 || channelIndex >= static_cast<int>(project_.channels.size())) {
+        return false;
+    }
+    if (channelIndex < static_cast<int>(soloHeld_.size())) {
+        const int held = soloHeld_[static_cast<size_t>(channelIndex)].load(std::memory_order_relaxed);
+        if (held == 1) {
+            return true;
+        }
+        if (held == 2) {
+            return false;
+        }
+    }
+    return project_.channels[static_cast<size_t>(channelIndex)].solo;
+}
+
 void Engine::buildSoloMask() {
     const int count = static_cast<int>(project_.channels.size());
-    soloPlay_.assign(static_cast<size_t>(count), 1);
-    if (!project_.anySolo()) {
+    if (static_cast<int>(soloPlay_.size()) != count) {
+        soloPlay_.assign(static_cast<size_t>(count), 1);
+    }
+    bool anySolo = false;
+    for (int channelIndex = 0; channelIndex < count; ++channelIndex) {
+        const MixerChannel& channel = project_.channels[static_cast<size_t>(channelIndex)];
+        if (channel.audible && soloEnabled(channelIndex)) {
+            anySolo = true;
+            break;
+        }
+    }
+    if (!anySolo) {
+        std::fill(soloPlay_.begin(), soloPlay_.end(), static_cast<std::uint8_t>(1));
         return;
     }
-    std::fill(soloPlay_.begin(), soloPlay_.end(), 0);
+    std::fill(soloPlay_.begin(), soloPlay_.end(), static_cast<std::uint8_t>(0));
     for (int channelIndex = 0; channelIndex < count; ++channelIndex) {
-        if (project_.channels[static_cast<size_t>(channelIndex)].solo) {
+        if (soloEnabled(channelIndex)) {
             soloPlay_[static_cast<size_t>(channelIndex)] = 1;
         }
     }
@@ -879,6 +937,11 @@ void Engine::fillLoop() {
 }
 
 void Engine::mixBlock(float* deviceOut, int frameCount, bool advance) {
+    const int soloEpoch = soloEpoch_.load(std::memory_order_acquire);
+    if (soloEpoch != appliedSoloEpoch_) {
+        buildSoloMask();
+        appliedSoloEpoch_ = soloEpoch;
+    }
     const int busChannels = 2;
     const size_t channelCount = project_.channels.size();
     const int frames = std::max(frameCount, 0);
@@ -991,15 +1054,25 @@ void Engine::mixBlock(float* deviceOut, int frameCount, bool advance) {
         const MixerChannel& channel = project_.channels[static_cast<size_t>(channelIndex)];
         float* bus = buses_.data() + static_cast<size_t>(channelIndex) * static_cast<size_t>(busChannels) *
                                           static_cast<size_t>(frames);
+        // A held fader replaces the file's volume curve. Mute follows the file until it is held.
+        const bool levelHeld = channelIndex < static_cast<int>(levelHeld_.size()) &&
+                               levelHeld_[static_cast<size_t>(channelIndex)].load(std::memory_order_relaxed) != 0;
+        const float heldLevel = channelIndex < static_cast<int>(levelLinear_.size())
+                                    ? levelLinear_[static_cast<size_t>(channelIndex)].load(std::memory_order_relaxed)
+                                    : 1.0f;
+        const int muteMode = channelIndex < static_cast<int>(muteHeld_.size())
+                                 ? muteHeld_[static_cast<size_t>(channelIndex)].load(std::memory_order_relaxed)
+                                 : 0;
         for (int frame = 0; frame < frames; ++frame) {
             const double seconds = secondClock_[static_cast<size_t>(frame)];
             const double beats = beatClock_[static_cast<size_t>(frame)];
             const auto clockOf = [&](const AutomationCurve& curve) {
                 return curve.timeUnit == TimeUnit::Seconds ? seconds : beats;
             };
-            const double volume = channel.volume.valueAt(clockOf(channel.volume));
+            const double volume = levelHeld ? static_cast<double>(heldLevel) : channel.volume.valueAt(clockOf(channel.volume));
             const double pan = channel.pan.valueAt(clockOf(channel.pan));
-            const bool muted = channel.mute.valueAt(clockOf(channel.mute)) >= 0.5;
+            const bool fileMuted = channel.mute.valueAt(clockOf(channel.mute)) >= 0.5;
+            const bool muted = muteMode == 1 || (muteMode == 0 && fileMuted);
             const float angle = std::clamp(static_cast<float>(pan), 0.0f, 1.0f) * 1.5707963f;
             const float leftGain = muted ? 0.0f : static_cast<float>(volume) * std::cos(angle);
             const float rightGain = muted ? 0.0f : static_cast<float>(volume) * std::sin(angle);

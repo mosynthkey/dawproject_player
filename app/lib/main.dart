@@ -8,6 +8,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 import 'dawplay_bridge.dart';
+import 'arrangement.dart';
 import 'theme.dart';
 
 Future<void> main() async {
@@ -49,6 +50,11 @@ class _LibraryPageState extends State<LibraryPage> {
   int _deviceIndex = -1;
   List<String> _devices = const [];
   PlaybackSession? _playback;
+  StreamSubscription<double>? _positions;
+  final List<TrackMix> _mix = [];
+  final ValueNotifier<double> _position = ValueNotifier(0);
+  bool _scrubbing = false;
+  DateTime _holdPositionUntil = DateTime.fromMillisecondsSinceEpoch(0);
 
   @override
   void initState() {
@@ -234,8 +240,15 @@ class _LibraryPageState extends State<LibraryPage> {
     if (playback == null) {
       return;
     }
+    await _positions?.cancel();
+    _positions = null;
     setState(() => _playback = null);
     await playback.stop();
+  }
+
+  Future<void> _reload() async {
+    await _stopPlayback();
+    await _loadSelected();
   }
 
   Future<void> _loadSelected() async {
@@ -262,6 +275,14 @@ class _LibraryPageState extends State<LibraryPage> {
       setState(() {
         _info = info;
         _infoLoading = false;
+        _position.value = 0;
+        _scrubbing = false;
+        _mix
+          ..clear()
+          ..addAll([
+            for (final channel in info.channels)
+              TrackMix(volume: channel.volume, muted: channel.muted, solo: channel.solo),
+          ]);
       });
     } catch (error) {
       if (!mounted || generation != _infoGeneration) {
@@ -271,6 +292,8 @@ class _LibraryPageState extends State<LibraryPage> {
         _info = null;
         _infoError = error.toString();
         _infoLoading = false;
+        _mix.clear();
+        _position.value = 0;
       });
     }
   }
@@ -286,7 +309,13 @@ class _LibraryPageState extends State<LibraryPage> {
       return;
     }
     try {
-      final session = await startPlayback(binary, _paths[index], _deviceIndex);
+      final length = _info?.lengthSeconds ?? 0;
+      var start = _position.value;
+      if (length > 0 && start >= length - 0.5) {
+        start = 0;
+        _position.value = 0;
+      }
+      final session = await startPlayback(binary, _paths[index], _deviceIndex, seekSeconds: start);
       if (!mounted) {
         await session.stop();
         return;
@@ -295,10 +324,19 @@ class _LibraryPageState extends State<LibraryPage> {
         _playback = session;
         _notice = null;
       });
-      unawaited(session.process.exitCode.then((_) {
+      await _pushMixer(session);
+      _positions = session.positions.listen((seconds) {
+        if (!mounted || _playback != session || _scrubbing || DateTime.now().isBefore(_holdPositionUntil)) {
+          return;
+        }
+        _position.value = seconds;
+      });
+      unawaited(session.process.exitCode.then((_) async {
         if (!mounted || _playback != session) {
           return;
         }
+        await _positions?.cancel();
+        _positions = null;
         setState(() => _playback = null);
       }));
     } catch (error) {
@@ -308,8 +346,96 @@ class _LibraryPageState extends State<LibraryPage> {
     }
   }
 
+  Future<void> _pushMixer(PlaybackSession session) async {
+    for (var channelIndex = 0; channelIndex < _mix.length; channelIndex++) {
+      final mix = _mix[channelIndex];
+      if (mix.volumeHeld) {
+        await session.command('volume $channelIndex ${mix.volume.toStringAsFixed(5)}');
+      }
+      if (mix.muteHeld) {
+        await session.command('mute $channelIndex ${mix.muted ? 1 : 0}');
+      }
+      if (mix.soloHeld) {
+        await session.command('solo $channelIndex ${mix.solo ? 1 : 0}');
+      }
+    }
+  }
+
+  void _send(String line) {
+    final playback = _playback;
+    if (playback == null) {
+      return;
+    }
+    unawaited(playback.command(line));
+  }
+
+  double _clampPosition(double seconds) {
+    final length = _info?.lengthSeconds ?? 0;
+    if (!seconds.isFinite || length <= 0) {
+      return 0;
+    }
+    return seconds.clamp(0.0, length);
+  }
+
+  void _seekTo(double seconds) {
+    final clamped = _clampPosition(seconds);
+    _holdPositionUntil = DateTime.now().add(const Duration(milliseconds: 350));
+    _position.value = clamped;
+    _send('seek ${clamped.toStringAsFixed(3)}');
+  }
+
+  void _beginScrub() {
+    _scrubbing = true;
+  }
+
+  void _scrubTo(double seconds) {
+    final clamped = _clampPosition(seconds);
+    _holdPositionUntil = DateTime.now().add(const Duration(milliseconds: 350));
+    _position.value = clamped;
+    _send('seek ${clamped.toStringAsFixed(3)}');
+  }
+
+  void _endScrub() {
+    setState(() => _scrubbing = false);
+  }
+
+  void _setVolume(int channelIndex, double linear) {
+    if (channelIndex < 0 || channelIndex >= _mix.length) {
+      return;
+    }
+    final mix = _mix[channelIndex];
+    mix.volume = linear;
+    mix.volumeHeld = true;
+    setState(() {});
+    _send('volume $channelIndex ${linear.toStringAsFixed(5)}');
+  }
+
+  void _toggleMute(int channelIndex) {
+    if (channelIndex < 0 || channelIndex >= _mix.length) {
+      return;
+    }
+    final mix = _mix[channelIndex];
+    mix.muted = !mix.muted;
+    mix.muteHeld = true;
+    setState(() {});
+    _send('mute $channelIndex ${mix.muted ? 1 : 0}');
+  }
+
+  void _toggleSolo(int channelIndex) {
+    if (channelIndex < 0 || channelIndex >= _mix.length) {
+      return;
+    }
+    final mix = _mix[channelIndex];
+    mix.solo = !mix.solo;
+    mix.soloHeld = true;
+    setState(() {});
+    _send('solo $channelIndex ${mix.solo ? 1 : 0}');
+  }
+
   @override
   void dispose() {
+    _positions?.cancel();
+    _position.dispose();
     _playback?.process.kill();
     super.dispose();
   }
@@ -347,10 +473,11 @@ class _LibraryPageState extends State<LibraryPage> {
         _DetailHeader(
           name: p.basename(path),
           path: path,
+          application: _info?.application ?? '',
           canPlay: _binary != null && !_infoLoading,
           playing: _playback != null,
           onPlay: _play,
-          onRefresh: _loadSelected,
+          onRefresh: _reload,
         ),
         if (!_binaryReady)
           const LinearProgressIndicator(minHeight: 2, color: DawColors.accent)
@@ -384,42 +511,36 @@ class _LibraryPageState extends State<LibraryPage> {
     if (info == null) {
       return const SizedBox.shrink();
     }
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(28, 8, 28, 28),
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Wrap(
-          spacing: 10,
-          runSpacing: 10,
-          children: [
-            _Stat(label: 'Application', value: info.application.isEmpty ? '(none)' : info.application),
-            _Stat(label: 'Length', value: _formatLength(info.lengthSeconds)),
-            _Stat(label: 'Events', value: '${info.events}'),
-            _Stat(label: 'Tempo points', value: '${info.tempoPoints}'),
-          ],
-        ),
-        const SizedBox(height: 28),
-        const Text(
-          'CHANNELS',
-          style: TextStyle(color: DawColors.textLow, fontSize: 12, fontWeight: FontWeight.w700, letterSpacing: 0.6),
-        ),
-        const SizedBox(height: 10),
-        if (info.channels.isEmpty)
-          const Text('No channels', style: TextStyle(color: DawColors.textLow))
-        else
-          for (final channel in info.channels) _ChannelTile(channel: channel),
-        if (info.warnings.isNotEmpty) ...[
-          const SizedBox(height: 28),
-          const Text(
-            'WARNINGS',
-            style: TextStyle(color: DawColors.textLow, fontSize: 12, fontWeight: FontWeight.w700, letterSpacing: 0.6),
-          ),
-          const SizedBox(height: 10),
-          for (final warning in info.warnings)
-            Padding(
-              padding: const EdgeInsets.only(bottom: 8),
-              child: Text(warning, style: const TextStyle(color: DawColors.warning, fontSize: 14)),
+        if (info.warnings.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+            child: Text(
+              info.warnings.toSet().take(2).join('\n'),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: DawColors.warning, fontSize: 12),
             ),
-        ],
+          ),
+        Expanded(
+          child: ArrangementView(
+            channels: info.channels,
+            clips: info.clips,
+            mix: _mix,
+            lengthSeconds: info.lengthSeconds,
+            position: _position,
+            followPlayhead: _playback != null && !_scrubbing,
+            onSeek: _seekTo,
+            onScrubStart: _beginScrub,
+            onScrub: _scrubTo,
+            onScrubEnd: _endScrub,
+            onVolume: _setVolume,
+            onMute: _toggleMute,
+            onSolo: _toggleSolo,
+          ),
+        ),
       ],
     );
   }
@@ -565,6 +686,7 @@ class _DetailHeader extends StatelessWidget {
   const _DetailHeader({
     required this.name,
     required this.path,
+    required this.application,
     required this.canPlay,
     required this.playing,
     required this.onPlay,
@@ -573,6 +695,7 @@ class _DetailHeader extends StatelessWidget {
 
   final String name;
   final String path;
+  final String application;
   final bool canPlay;
   final bool playing;
   final VoidCallback onPlay;
@@ -590,7 +713,12 @@ class _DetailHeader extends StatelessWidget {
               children: [
                 Text(name, style: const TextStyle(color: DawColors.textHigh, fontSize: 22, fontWeight: FontWeight.w700)),
                 const SizedBox(height: 4),
-                Text(path, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: DawColors.textLow, fontSize: 12)),
+                Text(
+                  application.isEmpty ? path : '$application · $path',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: DawColors.textLow, fontSize: 12),
+                ),
               ],
             ),
           ),
@@ -698,81 +826,4 @@ class _Banner extends StatelessWidget {
       child: Text(message, style: const TextStyle(color: DawColors.warning, fontSize: 13)),
     );
   }
-}
-
-class _Stat extends StatelessWidget {
-  const _Stat({required this.label, required this.value});
-
-  final String label;
-  final String value;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: 160,
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-      decoration: BoxDecoration(
-        color: DawColors.base,
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: DawColors.border),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(label, style: const TextStyle(color: DawColors.textLow, fontSize: 11, fontWeight: FontWeight.w700)),
-          const SizedBox(height: 6),
-          Text(value, style: const TextStyle(color: DawColors.textHigh, fontSize: 16, fontWeight: FontWeight.w600)),
-        ],
-      ),
-    );
-  }
-}
-
-class _ChannelTile extends StatelessWidget {
-  const _ChannelTile({required this.channel});
-
-  final ChannelRow channel;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      margin: const EdgeInsets.only(bottom: 6),
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-      decoration: BoxDecoration(
-        color: DawColors.base,
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Row(
-        children: [
-          SizedBox(
-            width: 28,
-            child: Text('${channel.index}', style: const TextStyle(color: DawColors.textLow, fontSize: 13)),
-          ),
-          Expanded(
-            child: Text(
-              channel.name,
-              style: const TextStyle(color: DawColors.textHigh, fontSize: 15, fontWeight: FontWeight.w600),
-            ),
-          ),
-          Text(channel.role, style: const TextStyle(color: DawColors.textBody, fontSize: 13)),
-          const SizedBox(width: 16),
-          if (channel.solo)
-            const Padding(
-              padding: EdgeInsets.only(right: 16),
-              child: Text('solo', style: TextStyle(color: DawColors.accent, fontSize: 13)),
-            ),
-          Text(channel.hardwareLabel, style: const TextStyle(color: DawColors.textLow, fontSize: 13)),
-        ],
-      ),
-    );
-  }
-}
-
-String _formatLength(double seconds) {
-  final safe = seconds < 0 ? 0.0 : seconds;
-  final whole = safe.floor();
-  final minutes = whole ~/ 60;
-  final remain = whole % 60;
-  final tenths = ((safe - whole) * 10).floor().clamp(0, 9);
-  return '$minutes:${remain.toString().padLeft(2, '0')}.$tenths';
 }

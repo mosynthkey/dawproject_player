@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 class DawplayException implements Exception {
@@ -16,6 +17,8 @@ class ChannelRow {
     required this.name,
     required this.role,
     required this.solo,
+    required this.muted,
+    required this.volume,
     required this.hardwareStart,
     required this.hardwareWidth,
   });
@@ -24,6 +27,8 @@ class ChannelRow {
   final String name;
   final String role;
   final bool solo;
+  final bool muted;
+  final double volume;
   final int hardwareStart;
   final int hardwareWidth;
 
@@ -39,7 +44,7 @@ class ChannelRow {
 
   static ChannelRow? tryParse(String line) {
     final match = RegExp(
-      r'^\s*\[(\d+)\]\s+(.*)\s+role=(\S+)\s+solo=(yes|no)\s+hw=(-?\d+)/(\d+)\s*$',
+      r'^\s*\[(\d+)\]\s+(.*)\s+role=(\S+)\s+solo=(yes|no)\s+mute=(yes|no)\s+vol=(\S+)\s+hw=(-?\d+)/(\d+)\s*$',
     ).firstMatch(line);
     if (match == null) {
       return null;
@@ -49,9 +54,37 @@ class ChannelRow {
       name: match.group(2)!,
       role: match.group(3)!,
       solo: match.group(4) == 'yes',
-      hardwareStart: int.parse(match.group(5)!),
-      hardwareWidth: int.parse(match.group(6)!),
+      muted: match.group(5) == 'yes',
+      volume: double.tryParse(match.group(6)!) ?? 1,
+      hardwareStart: int.parse(match.group(7)!),
+      hardwareWidth: int.parse(match.group(8)!),
     );
+  }
+}
+
+class ClipSpan {
+  const ClipSpan({required this.channelIndex, required this.start, required this.end, required this.name});
+
+  final int channelIndex;
+  final double start;
+  final double end;
+  final String name;
+
+  static ClipSpan? tryParse(String line) {
+    if (!line.startsWith('clip\t')) {
+      return null;
+    }
+    final parts = line.split('\t');
+    if (parts.length < 5) {
+      return null;
+    }
+    final channelIndex = int.tryParse(parts[1]);
+    final start = double.tryParse(parts[2]);
+    final end = double.tryParse(parts[3]);
+    if (channelIndex == null || start == null || end == null || end <= start) {
+      return null;
+    }
+    return ClipSpan(channelIndex: channelIndex, start: start, end: end, name: parts.sublist(4).join('\t'));
   }
 }
 
@@ -62,6 +95,7 @@ class ProjectInfo {
     required this.tempoPoints,
     required this.events,
     required this.channels,
+    required this.clips,
     required this.warnings,
   });
 
@@ -70,6 +104,7 @@ class ProjectInfo {
   final int tempoPoints;
   final int events;
   final List<ChannelRow> channels;
+  final List<ClipSpan> clips;
   final List<String> warnings;
 
   static ProjectInfo parse(String text) {
@@ -78,8 +113,10 @@ class ProjectInfo {
     var tempoPoints = 0;
     var events = 0;
     final channels = <ChannelRow>[];
+    final clips = <ClipSpan>[];
     final warnings = <String>[];
-    for (final line in text.split('\n')) {
+    for (final raw in text.split('\n')) {
+      final line = raw.trimRight();
       if (line.startsWith('Application: ')) {
         application = line.substring('Application: '.length).trim();
       } else if (line.startsWith('Length: ')) {
@@ -92,6 +129,11 @@ class ProjectInfo {
       } else if (line.startsWith('Warning: ')) {
         warnings.add(line.substring('Warning: '.length).trim());
       } else {
+        final clip = ClipSpan.tryParse(line);
+        if (clip != null) {
+          clips.add(clip);
+          continue;
+        }
         final channel = ChannelRow.tryParse(line);
         if (channel != null) {
           channels.add(channel);
@@ -104,6 +146,7 @@ class ProjectInfo {
       tempoPoints: tempoPoints,
       events: events,
       channels: channels,
+      clips: clips,
       warnings: warnings,
     );
   }
@@ -165,11 +208,24 @@ Future<List<String>> listPlaybackDevices(String binary) async {
 }
 
 class PlaybackSession {
-  PlaybackSession(this.process);
+  PlaybackSession(this.process, this._positions);
 
   final Process process;
+  final StreamController<double> _positions;
+
+  Stream<double> get positions => _positions.stream;
+
+  Future<void> command(String line) async {
+    try {
+      process.stdin.writeln(line);
+      await process.stdin.flush();
+    } catch (_) {}
+  }
 
   Future<void> stop() async {
+    if (!_positions.isClosed) {
+      await _positions.close();
+    }
     try {
       await process.stdin.close();
     } catch (_) {}
@@ -181,22 +237,46 @@ class PlaybackSession {
   }
 }
 
-Future<PlaybackSession> startPlayback(String binary, String projectPath, int deviceIndex) async {
+Future<PlaybackSession> startPlayback(String binary, String projectPath, int deviceIndex, {double seekSeconds = 0}) async {
   final arguments = <String>['play', projectPath];
   if (deviceIndex >= 0) {
     arguments.addAll(['--device', '$deviceIndex']);
   }
+  if (seekSeconds > 0.001) {
+    arguments.addAll(['--seek', seekSeconds.toStringAsFixed(3)]);
+  }
   final process = await Process.start(binary, arguments);
+  final positions = StreamController<double>();
   final errors = StringBuffer();
   process.stderr.transform(systemEncoding.decoder).listen(errors.write);
   final ready = Completer<void>();
-  final output = StringBuffer();
-  process.stdout.transform(systemEncoding.decoder).listen((chunk) {
-    output.write(chunk);
-    if (!ready.isCompleted && output.toString().contains('playing')) {
-      ready.complete();
-    }
-  });
+  var pending = '';
+  process.stdout.transform(utf8.decoder).listen(
+    (chunk) {
+      pending += chunk;
+      while (true) {
+        final newline = pending.indexOf('\n');
+        if (newline < 0) {
+          break;
+        }
+        final line = pending.substring(0, newline).trim();
+        pending = pending.substring(newline + 1);
+        if (line == 'playing' && !ready.isCompleted) {
+          ready.complete();
+        } else if (line.startsWith('pos ')) {
+          final seconds = double.tryParse(line.substring(4));
+          if (seconds != null && !positions.isClosed) {
+            positions.add(seconds);
+          }
+        }
+      }
+    },
+    onDone: () {
+      if (!positions.isClosed) {
+        positions.close();
+      }
+    },
+  );
   unawaited(process.exitCode.then((code) {
     if (ready.isCompleted) {
       return;
@@ -208,10 +288,13 @@ Future<PlaybackSession> startPlayback(String binary, String projectPath, int dev
     await ready.future.timeout(const Duration(seconds: 30));
   } catch (error) {
     process.kill();
+    if (!positions.isClosed) {
+      await positions.close();
+    }
     if (error is TimeoutException) {
       throw DawplayException('Playback did not start');
     }
     rethrow;
   }
-  return PlaybackSession(process);
+  return PlaybackSession(process, positions);
 }
